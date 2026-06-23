@@ -1,0 +1,48 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# Editor + OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# venv
+.venv/
+venv/
+env/
+
+# Generated walkthrough output (re-created by examples/tuning_walkthrough.py)
+tuning_0*.png
+mask_clean.png
+mask_clean2.png
+mask_noisy.png
+mask_gapped.png
+example_mask.png
+example_overlay.png
+
+# Compiled Cython artefacts (re-built by `pip install -e .`)
+src/net3/*.so
+src/net3/C_net_functions.c
