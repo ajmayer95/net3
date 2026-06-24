@@ -102,29 +102,17 @@ foreground components smaller than this many pixels. The default of
 3000 is tuned for the canonical case the package was built for; for
 finer-scale data, drop it to 100–500. See "Tuning the flags" below.
 
-## What it does
-
-```
-mask → distance transform → contours → constrained Delaunay
-     → triangle classification (branch / junction / sleeve)
-     → prune short branch triangles
-     → adjacency → NetworkX graph
-     → collapse degree-2 chains
-     → keep largest connected component
-```
-
-Output schema:
+## Output schema
 
 | key | where | unit | meaning |
 |---|---|---|---|
 | `x`, `y` | node attr | pixels | image coords (y is flipped to mathematical convention) |
-| `radius` | node attr | pixels | distance transform at that triangle's center |
-| `radius` | edge attr | pixels | mean of endpoint radii |
+| `radius` | node + edge attr | pixels | distance-transform value (node) or mean of endpoint radii (edge) |
 | `weight` | edge attr | pixels | Euclidean distance between endpoints |
 
-A separate `collapse_to_branch_graph(G)` is available if you want one
-edge per branch (instead of per inter-junction segment) — useful for
-per-branch (rather than per-segment) analysis.
+`collapse_to_branch_graph(G)` gives one edge per branch (instead of
+per inter-junction segment) with the full path geometry stored as an
+edge attribute.
 
 ## Tuning the flags
 
@@ -150,52 +138,15 @@ and **graph cleanup** (after). Mask cleanup is applied in this order:
 | `--prune-dangling` | off | After everything else, removes degree-1 dangling tips. | Use to remove single short edges sticking out of junctions (segmentation noise). Combine with `--prune-dangling-min-length`. |
 | `--prune-dangling-min-length` | 0 | Only prune dangling tips **shorter than N pixels**. | Keeps long end-branches (probably real) while removing short spurs. Sensible: a small multiple of the typical branch radius, e.g. 30–50 px. |
 
-### Recipe book
+### How to tune
 
-Clean mask, want most detail (defaults):
-```bash
-net3 mask.tif -o g.gpickle
-```
+Run with defaults first, visualise the result, then diagnose:
 
-Noisy segmentation with tile seams (mosaic-style data):
-```bash
-net3 mask.tif -o g.gpickle \
-    --bridge-gaps 10 --smoothing 2 \
-    --prune-dangling --prune-dangling-min-length 30
-```
+- **Spurious tiny edges everywhere** → bump `--prune-order` or add `--prune-dangling --prune-dangling-min-length N`.
+- **Branches broken into pieces** → add `--bridge-gaps 10`, or check whether `--invert` is needed.
+- **Real branches missing** → `--min-feature-size` is too high, or `--smoothing` is eroding them.
 
-Fine-scale data with small features:
-```bash
-net3 mask.tif -o g.gpickle \
-    --min-feature-size 200 --prune-order 3
-```
-
-Skeleton with every intermediate node, no collapse (for per-segment analysis):
-```bash
-net3 mask.tif -o g.gpickle --remove-redundant none
-```
-
-Coarse "main branches only" graph:
-```bash
-net3 mask.tif -o g.gpickle \
-    --min-feature-size 8000 --prune-order 12 \
-    --prune-dangling --prune-dangling-min-length 80
-```
-
-### How to tune in practice
-
-There's no auto-tuning. Iterate:
-
-1. Run with **defaults first**.
-2. Quick-visualise the result: `imshow(mask)` + `nx.draw_networkx_edges(G, pos)` (the pattern in [`examples/quickstart.py`](examples/quickstart.py)).
-3. Diagnose by failure mode:
-   - **Spurious tiny edges everywhere** → bump `--prune-order` or add `--prune-dangling`.
-   - **Branches broken into pieces** → add `--bridge-gaps 10`, or check whether `--invert` is needed.
-   - **Real branches missing** → `--min-feature-size` is too high, or `--smoothing` is eroding them.
-
-Iterative visualisation is dramatically faster than guessing every flag right on the first run.
-
-[`examples/tuning_walkthrough.py`](examples/tuning_walkthrough.py) generates four side-by-side PNG comparisons that walk you through each failure mode visually — clean baseline, spurs from segmentation noise, broken trunk reconnected via `--bridge-gaps`, and a `--min-feature-size` sweep. Run it from the repo root after install to produce reference imagery you can compare your own tuning attempts against.
+For fine-scale data, drop `--min-feature-size` to ~200 and `--prune-order` to 3. For noisy mask boundaries, add `--smoothing 2`. Run `examples/tuning_walkthrough.py` after install for visual examples of each failure mode.
 
 ### A gotcha worth knowing
 
@@ -305,25 +256,10 @@ branches keep their structure.
 
 ### Backend API (no GUI)
 
-The editing operations live in `net3.edit.GraphEditor` — a plain
-Python class that wraps a NetworkX graph with selection state and an
-undo stack. Use it directly in scripts or notebooks:
-
-```python
-from net3.edit import GraphEditor
-
-ed = GraphEditor.from_gpickle("graph.gpickle")
-ed.select(42)
-ed.delete_selected()
-ed.add_node(120.5, 80.0)
-ed.connect_selected_pair()
-n_collapsed = ed.streamline()
-ed.undo()                  # restore the last mutation
-ed.save("edited.gpickle")
-```
-
-All operations have unit tests (`tests/test_edit_core.py`) that pass
-without napari installed.
+All editing operations live in `net3.edit.GraphEditor` — a plain
+Python class usable from scripts/notebooks without napari. See its
+docstring (`help(net3.edit.GraphEditor)`) or `tests/test_edit_core.py`
+for the full surface.
 
 ## Caveats
 
