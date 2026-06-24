@@ -206,21 +206,32 @@ net3 edit graph_edit.gpickle --mask mask.tif --save graph_edit.gpickle
 If you launch the editor on a graph that's already been streamlined,
 it'll print a hint with the right command to re-vectorise.
 
-### Controls
+### Modes
 
-| Action | Key | Mouse |
-|---|---|---|
-| Toggle nearest node OR edge | — | Left click (node wins over edge if both in range) |
-| Create node (snap-to-centerline) | — | Shift + left click on empty canvas |
-| Rectangle select (replace) | — | Right click + drag |
-| Rectangle select (additive) | — | Shift + right click + drag |
-| Delete selected nodes AND edges | `d` | — |
-| Connect two selected nodes | `e` | — |
-| Highlight cycles | `m` | — |
-| Streamline (collapse degree-2) | `n` | — |
-| Clear selection | `c` | — |
-| Undo last edit | `z` | — |
-| Save | `s` | — |
+Click a mode button in the dock (or press `1` / `2` / `3`) to switch.
+Only one mode is on at a time.
+
+| Mode | Key | What left-click does | What left-drag does |
+|---|---|---|---|
+| **Select** (default) | `1` | Toggle nearest node OR edge | Pan |
+| **Rect-Select** | `2` | Same as Select (single click still works) | Rubber-band → select nodes inside on release |
+| **Add Node** | `3` | Create new node (snapped) | Pan |
+
+Shift modifiers:
+- **Shift + click** in any mode → create new node (a shortcut, doesn't require switching mode).
+- **Shift + drag** in Rect-Select → additive selection.
+
+### Actions
+
+| Action | Key |
+|---|---|
+| Delete selected nodes AND edges | `d` |
+| Connect two selected nodes | `e` |
+| Highlight cycles | `m` |
+| Streamline (collapse degree-2) | `n` |
+| Clear selection | `c` |
+| Undo last edit | `z` |
+| Save | `s` |
 
 Node colors: **green** = degree-1 tip, **cyan** = degree-≥3 junction,
 **red** = intermediate, **yellow** = selected.

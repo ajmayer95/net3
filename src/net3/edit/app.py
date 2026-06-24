@@ -131,16 +131,28 @@ class _EditorApp:
                           if editor.mask is not None
                           else self._infer_height_from_graph())
         self.viewer = napari.Viewer(title=f"net3 edit · {default_save_path.name}")
+        # Base layers: built on graph mutation only; selection visuals
+        # live in small overlay layers (selected_nodes / selected_edges)
+        # so toggling selection is O(|selected|), independent of the
+        # base graph size.
         self._nodes_layer = None
         self._edges_layer = None
+        self._sel_nodes_overlay = None
+        self._sel_edges_overlay = None
         self._rubber_band_layer = None
+        # Mode state
+        self._mode: str = "select"   # "select" | "rect" | "add"
         # Stable ordering for the points layer — backend node ids in
         # whatever order we built the points array.  Used to map napari
         # selection indices back to graph node ids.
         self._node_index_order: List = []
-        # edge layer index → canonical (u,v); inverse map built lazily.
+        # edge layer index → canonical (u,v) — kept for any future
+        # incremental ops on the base layer.
         self._edge_index_order: List[Tuple] = []
         self._edge_pair_to_index: dict = {}
+        # Cache node positions (graph coords) by id, populated on
+        # node-layer build, used to draw the selection overlay quickly.
+        self._node_xy_by_id: dict = {}
 
         self._build_layers()
         self._build_dock(QPushButton, QLabel, QVBoxLayout, QWidget)
@@ -159,15 +171,20 @@ class _EditorApp:
                 self.editor.mask, name="mask",
                 colormap="gray", opacity=1.0,
             )
-        self._refresh_nodes_layer()
         self._refresh_edges_layer()
+        self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
         self.viewer.reset_view()
 
     def _node_positions_and_colors(self):
+        """Base nodes layer — coloured only by degree, NOT by
+        selection.  Selection visuals live in a small overlay layer
+        rebuilt independently so selection toggles stay O(1)."""
         positions = []
         face_colors = []
         sizes = []
         ids: List = []
+        xy_by_id: dict = {}
         G = self.editor.graph
         for n, d in G.nodes(data=True):
             x = d.get("x"); y = d.get("y")
@@ -175,20 +192,17 @@ class _EditorApp:
                 continue
             positions.append([self._image_h - float(y), float(x)])
             ids.append(n)
+            xy_by_id[n] = (float(x), float(y))
             deg = G.degree(n)
-            if n in self.editor.selected:
-                face_colors.append(NODE_COLOR_SELECTED)
-                sizes.append(NODE_SIZE_SELECTED)
-            elif deg >= 3:
+            if deg >= 3:
                 face_colors.append(NODE_COLOR_JUNCTION)
-                sizes.append(NODE_SIZE_DEFAULT)
             elif deg == 1:
                 face_colors.append(NODE_COLOR_TIP)
-                sizes.append(NODE_SIZE_DEFAULT)
             else:
                 face_colors.append(NODE_COLOR_UNSELECTED)
-                sizes.append(NODE_SIZE_DEFAULT)
+            sizes.append(NODE_SIZE_DEFAULT)
         self._node_index_order = ids
+        self._node_xy_by_id = xy_by_id
         return (np.array(positions) if positions
                 else np.zeros((0, 2))), face_colors, sizes
 
@@ -211,12 +225,12 @@ class _EditorApp:
         )
 
     def _refresh_edges_layer(self) -> None:
+        """Base edges layer — uniform orange, never modified for
+        selection.  Selected edges are drawn yellow on top in a small
+        overlay (see `_refresh_selection_overlays`)."""
         segments = []
-        edge_colors = []
-        edge_widths = []
         edge_pairs: List[Tuple] = []
         G = self.editor.graph
-        sel_edges = self.editor.selected_edges
         canon = GraphEditor._canonical_edge
         for u, v in G.edges:
             xu = float(G.nodes[u].get("x", 0.0))
@@ -227,16 +241,7 @@ class _EditorApp:
                 [self._image_h - yu, xu],
                 [self._image_h - yv, xv],
             ])
-            ck = canon(u, v)
-            edge_pairs.append(ck)
-            if ck in sel_edges:
-                edge_colors.append(EDGE_COLOR_SELECTED)
-                edge_widths.append(EDGE_WIDTH_SELECTED)
-            else:
-                edge_colors.append(EDGE_COLOR)
-                edge_widths.append(EDGE_WIDTH)
-        # Maintain the index ↔ (u,v) maps so callers (click handler)
-        # can update one entry without rebuilding the whole layer.
+            edge_pairs.append(canon(u, v))
         self._edge_index_order = edge_pairs
         self._edge_pair_to_index = {p: i for i, p in enumerate(edge_pairs)}
         if self._edges_layer is not None:
@@ -250,8 +255,8 @@ class _EditorApp:
         self._edges_layer = self.viewer.add_shapes(
             segments,
             shape_type="line",
-            edge_color=edge_colors,
-            edge_width=edge_widths,
+            edge_color=EDGE_COLOR,
+            edge_width=EDGE_WIDTH,
             face_color="transparent",
             opacity=0.85,
             name="edges",
@@ -262,45 +267,68 @@ class _EditorApp:
         )
 
     def _refresh_all(self) -> None:
+        """Full rebuild — only on graph mutation (delete, add, etc).
+        Selection toggles use `_refresh_selection_overlays` instead."""
         self._refresh_edges_layer()
         self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
         self._refresh_status()
 
-    def _update_edge_visual(self, u, v, selected: bool) -> None:
-        """Fast in-place update of a single edge's color/width without
-        rebuilding the whole Shapes layer.  At ~20k edges, a full
-        rebuild is several seconds; this is a microsecond op."""
-        if self._edges_layer is None:
-            return
-        key = GraphEditor._canonical_edge(u, v)
-        idx = self._edge_pair_to_index.get(key)
-        if idx is None:
-            return
-        # napari's Shapes layer accepts numpy arrays for these
-        # properties.  Mutating in-place + reassigning triggers a
-        # repaint of only the changed shape on its next frame.
-        try:
-            colors = np.asarray(self._edges_layer.edge_color).copy()
-            widths = np.asarray(self._edges_layer.edge_width).copy()
-            new_color = self._color_rgba(
-                EDGE_COLOR_SELECTED if selected else EDGE_COLOR)
-            new_width = (EDGE_WIDTH_SELECTED if selected else EDGE_WIDTH)
-            if colors.ndim == 2 and colors.shape[1] == 4:
-                colors[idx] = new_color
-            self._edges_layer.edge_color = colors
-            if widths.ndim == 1:
-                widths[idx] = new_width
-                self._edges_layer.edge_width = widths
-        except Exception:
-            # Fallback: rebuild the layer.
-            self._refresh_edges_layer()
+    def _refresh_selection_overlays(self) -> None:
+        """Rebuild the small overlay layers that show selected nodes /
+        selected edges.  Cost is O(|selected|), not O(|graph|), so
+        selection toggles remain instant even at 20k edges."""
+        # --- selected edges overlay ---
+        sel_e = self.editor.selected_edges
+        seg = []
+        for (u, v) in sel_e:
+            pu = self._node_xy_by_id.get(u)
+            pv = self._node_xy_by_id.get(v)
+            if pu is None or pv is None:
+                continue
+            seg.append([
+                [self._image_h - pu[1], pu[0]],
+                [self._image_h - pv[1], pv[0]],
+            ])
+        if self._sel_edges_overlay is not None:
+            try:
+                self.viewer.layers.remove(self._sel_edges_overlay)
+            except (KeyError, ValueError):
+                pass
+            self._sel_edges_overlay = None
+        if seg:
+            self._sel_edges_overlay = self.viewer.add_shapes(
+                seg,
+                shape_type="line",
+                edge_color=EDGE_COLOR_SELECTED,
+                edge_width=EDGE_WIDTH_SELECTED,
+                face_color="transparent",
+                opacity=0.95,
+                name="selected edges",
+            )
 
-    @staticmethod
-    def _color_rgba(name: str):
-        """Convert a matplotlib-style colour name to a length-4 RGBA
-        array in [0, 1]."""
-        from matplotlib.colors import to_rgba
-        return np.asarray(to_rgba(name), dtype=float)
+        # --- selected nodes overlay ---
+        sel_n = self.editor.selected
+        positions = []
+        for n in sel_n:
+            pos = self._node_xy_by_id.get(n)
+            if pos is None:
+                continue
+            positions.append([self._image_h - pos[1], pos[0]])
+        if self._sel_nodes_overlay is not None:
+            try:
+                self.viewer.layers.remove(self._sel_nodes_overlay)
+            except (KeyError, ValueError):
+                pass
+            self._sel_nodes_overlay = None
+        if positions:
+            self._sel_nodes_overlay = self.viewer.add_points(
+                np.asarray(positions),
+                face_color=NODE_COLOR_SELECTED,
+                size=NODE_SIZE_SELECTED,
+                symbol="o",
+                name="selected nodes",
+            )
 
     # ── Build the dock widget ───────────────────────────────────
 
@@ -312,6 +340,40 @@ class _EditorApp:
 
         layout = QVBoxLayout()
         layout.addWidget(self._status_lbl)
+
+        # Mode toggles — checkable buttons that switch what left-drag
+        # / left-click does.  Only one mode is on at any time.
+        mode_label = QLabel("<b>Mode</b>")
+        mode_label.setStyleSheet("padding: 2px 6px;")
+        layout.addWidget(mode_label)
+        self._mode_btns: dict = {}
+
+        def _mode_btn(key: str, label: str, tooltip: str):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setToolTip(tooltip)
+            b.clicked.connect(lambda _=False, k=key: self._set_mode(k))
+            layout.addWidget(b)
+            self._mode_btns[key] = b
+            return b
+
+        _mode_btn("select", "Select  (key: 1)",
+                   "Default mode.  Left click toggles the nearest "
+                   "node or edge; left drag pans.")
+        _mode_btn("rect", "Rect-Select  (key: 2)",
+                   "Left drag draws a rubber-band rectangle and "
+                   "selects every node inside on release.  "
+                   "Hold Shift for additive.")
+        _mode_btn("add", "Add Node  (key: 3)",
+                   "Left click creates a new node (snapped to the "
+                   "local distance-transform peak if a distance "
+                   "map is loaded).")
+        # Default mode highlighted.
+        self._mode_btns["select"].setChecked(True)
+
+        action_label = QLabel("<b>Actions</b>")
+        action_label.setStyleSheet("padding: 6px 6px 2px 6px;")
+        layout.addWidget(action_label)
 
         def _btn(label: str, tooltip: str, callback):
             b = QPushButton(label)
@@ -383,6 +445,19 @@ class _EditorApp:
         def _(viewer):
             self._action_save()
 
+        # Mode shortcuts: 1 / 2 / 3 to switch.
+        @v.bind_key("1", overwrite=True)
+        def _(viewer):
+            self._set_mode("select")
+
+        @v.bind_key("2", overwrite=True)
+        def _(viewer):
+            self._set_mode("rect")
+
+        @v.bind_key("3", overwrite=True)
+        def _(viewer):
+            self._set_mode("add")
+
         # Mouse model:
         #   left click            : toggle nearest node, fall back to nearest edge
         #   Shift + left click    : create new node at click (snap-to-centerline)
@@ -421,18 +496,22 @@ class _EditorApp:
         return col, self._image_h - row
 
     def _mouse_handler(self, event):
-        """Generator that distinguishes click vs drag and dispatches
-        to the right action.  Left = click/Shift-create; right = rect
-        select."""
-        if event.button not in (1, 2):
+        """Mode-aware mouse handler.
+
+        - Select / Add-Node modes: left click does the click action;
+          left drag is left for napari to pan.
+        - Rect-Select mode: left drag draws a rubber band and selects
+          nodes inside on release.  Shift = additive.
+        """
+        if event.button != 1:
             return
         start = self._event_graph_xy(event)
         if start is None:
             return
-        is_right = (event.button == 2)
         shift = "Shift" in event.modifiers
         last = start
         moved = False
+        is_rect_mode = (self._mode == "rect")
         yield
         while event.type == "mouse_move":
             now = self._event_graph_xy(event)
@@ -442,13 +521,13 @@ class _EditorApp:
                 if (dx * dx + dy * dy) > (DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX):
                     moved = True
                 last = now
-                if is_right and moved:
+                if is_rect_mode and moved:
                     self._show_rubber_band(start, now)
             yield
         # mouse_release
         end = last
         self._hide_rubber_band()
-        if is_right:
+        if is_rect_mode:
             if moved:
                 self.editor.select_in_rect(
                     start[0], start[1], end[0], end[1], additive=shift,
@@ -456,22 +535,23 @@ class _EditorApp:
                 self._announce(
                     f"rectangle-selected: {len(self.editor.selected)} "
                     f"node(s)" + ("  (additive)" if shift else ""))
-                self._refresh_nodes_layer()
+                self._refresh_selection_overlays()
                 self._refresh_status()
             else:
-                self._announce("(right-click — drag to rectangle-select)")
-                self._refresh_status()
+                # Click while in rect mode → treat as a normal click so
+                # users can still toggle individual nodes/edges without
+                # leaving the mode.
+                self._handle_click(end[0], end[1], shift=shift)
             return
-        # Left button: click or drag
+        # Select / Add-Node modes
         if not moved:
             self._handle_click(end[0], end[1], shift=shift)
-        # else: plain left-drag → napari already panned
+        # else: left-drag in non-rect mode → napari panned, nothing to do
 
     def _handle_click(self, gx: float, gy: float, shift: bool) -> None:
         tol = self._click_tolerance()
-        # Shift+click on canvas → create a new node, snapped to the
-        # local centerline if a distance map is loaded.
-        if shift:
+        # Add-Node mode (or Shift+click in any mode) creates a new node.
+        if self._mode == "add" or shift:
             n = self.editor.add_node(gx, gy, snap_window=SNAP_WINDOW_DEFAULT)
             r = self.editor.graph.nodes[n].get("radius", 0.0)
             self._announce(
@@ -485,7 +565,7 @@ class _EditorApp:
             in_ = node_hit in self.editor.selected
             self._announce(
                 f"node {node_hit} {'selected' if in_ else 'deselected'}")
-            self._refresh_nodes_layer()
+            self._refresh_selection_overlays()
             self._refresh_status()
             return
         edge_hit = self.editor.edge_at(gx, gy, tolerance=tol)
@@ -495,10 +575,9 @@ class _EditorApp:
             sel = (u, v) in self.editor.selected_edges
             self._announce(
                 f"edge ({u},{v}) {'selected' if sel else 'deselected'}")
-            # Fast path: only update the single edge's visual, don't
-            # rebuild the whole Shapes layer.  At 20k edges, the full
-            # rebuild was the cause of the multi-second click lag.
-            self._update_edge_visual(u, v, sel)
+            # Overlay rebuild is O(|selected|), not O(|graph|), so this
+            # stays instant at 20k edges.
+            self._refresh_selection_overlays()
             self._refresh_status()
             return
         self._announce(
@@ -551,6 +630,24 @@ class _EditorApp:
     def _announce(self, msg: str) -> None:
         self._last_action = msg
 
+    def _set_mode(self, mode: str) -> None:
+        """Switch input mode.  Updates which dock button is highlighted
+        and which mouse behavior the handler uses."""
+        if mode not in ("select", "rect", "add"):
+            return
+        self._mode = mode
+        # Sync the button checked-state (uncheck others, check this).
+        for k, b in self._mode_btns.items():
+            try:
+                b.setChecked(k == mode)
+            except Exception:
+                pass
+        label = {"select": "Select",
+                  "rect": "Rect-Select",
+                  "add": "Add Node"}[mode]
+        self._announce(f"mode → {label}")
+        self._refresh_status()
+
     def _action_delete(self) -> None:
         # Delete BOTH selected nodes (with their incident edges) and
         # selected edges (keeping endpoint nodes).  Whichever the user
@@ -580,7 +677,7 @@ class _EditorApp:
         cycles = self.editor.find_cycles()
         self._announce(f"highlighted {n} new node(s) from "
                         f"{len(cycles)} cycle(s)")
-        self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
         self._refresh_status()
 
     def _action_streamline(self) -> None:
@@ -591,7 +688,7 @@ class _EditorApp:
     def _action_clear(self) -> None:
         self.editor.clear_selection()
         self._announce("selection cleared")
-        self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
         self._refresh_status()
 
     def _action_undo(self) -> None:
@@ -616,19 +713,18 @@ class _EditorApp:
 
     def _refresh_status(self) -> None:
         last = getattr(self, "_last_action", "(no action yet)")
+        mode_label = {"select": "Select",
+                       "rect": "Rect-Select",
+                       "add": "Add Node"}.get(self._mode, self._mode)
         text = (
+            f"<b>mode:</b> {mode_label}<br>"
             f"<b>graph:</b> {self.editor.n_nodes} nodes, "
             f"{self.editor.n_edges} edges<br>"
             f"<b>selected:</b> {len(self.editor.selected)} nodes, "
             f"{len(self.editor.selected_edges)} edges<br>"
             f"<b>undo depth:</b> {len(self.editor._undo_stack)}<br>"
             f"<br><b>last:</b> {last}<br>"
-            f"<br><b>save target:</b><br>{self.default_save_path}<br>"
-            f"<br><b>mouse:</b><br>"
-            f"&nbsp;&nbsp;left click = toggle nearest node/edge<br>"
-            f"&nbsp;&nbsp;Shift+left click = create node (snapped)<br>"
-            f"&nbsp;&nbsp;right click + drag = rectangle select<br>"
-            f"&nbsp;&nbsp;Shift+right click + drag = additive"
+            f"<br><b>save target:</b><br>{self.default_save_path}"
         )
         if self._status_lbl is not None:
             self._status_lbl.setText(text)
