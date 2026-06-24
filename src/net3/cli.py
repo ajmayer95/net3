@@ -128,16 +128,25 @@ def _run_edit(args: argparse.Namespace) -> int:
         print(f"error: distance map not found: {args.distance_map}",
               file=sys.stderr)
         return 2
-    try:
-        from .edit.app import run_editor
-    except ImportError as exc:
+    # Probe the GUI deps up front so a missing `napari` / `qtpy` /
+    # `PyQt5` produces a friendly install hint instead of a deep
+    # traceback from inside the editor (the editor lazily imports
+    # napari, so the outer `from .edit.app` succeeds even without it).
+    missing = []
+    for dep in ("napari", "qtpy"):
+        try:
+            __import__(dep)
+        except ImportError:
+            missing.append(dep)
+    if missing:
         print(
-            "error: net3 edit requires the [gui] extra to be installed:\n"
+            "error: net3 edit requires the [gui] extra to be installed.\n"
             "    pip install 'net3[gui]'\n"
-            f"underlying ImportError: {exc}",
+            f"missing module(s): {', '.join(missing)}",
             file=sys.stderr,
         )
         return 3
+    from .edit.app import run_editor
     run_editor(
         graph_path=args.graph,
         mask_path=args.mask,
