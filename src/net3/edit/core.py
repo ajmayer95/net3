@@ -372,9 +372,18 @@ class GraphEditor:
 
     def add_edge(self, u, v) -> bool:
         """Connect two nodes.  No-op if the nodes are the same, the
-        edge already exists, or one isn't in the graph.  Edge weight
-        is the Euclidean length between the nodes; edge radius is the
-        mean of endpoint radii.  Returns True if an edge was added."""
+        edge already exists, or one isn't in the graph.
+
+        Sets `weight` = `length` = Euclidean distance, `radius` = mean
+        of endpoint radii, and `path` = a 2-point straight-line polyline
+        ([[xu,yu], [xv,yv]]).  The `path` attribute matches the schema
+        produced by `net3.collapse_to_branch_graph`, so downstream
+        consumers that expect every edge to carry a centerline polyline
+        (PerTileFlow's ROI generation, for instance) don't need a
+        special case for editor-added edges.
+
+        Returns True if an edge was added.
+        """
         if u == v or u not in self.graph or v not in self.graph:
             return False
         if self.graph.has_edge(u, v):
@@ -387,7 +396,14 @@ class GraphEditor:
         length = math.hypot(xu - xv, yu - yv)
         ru = float(self.graph.nodes[u].get("radius", self.DEFAULT_RADIUS))
         rv = float(self.graph.nodes[v].get("radius", self.DEFAULT_RADIUS))
-        self.graph.add_edge(u, v, weight=length, radius=0.5 * (ru + rv))
+        path = np.array([[xu, yu], [xv, yv]], dtype=float)
+        self.graph.add_edge(
+            u, v,
+            weight=length,
+            length=length,
+            radius=0.5 * (ru + rv),
+            path=path,
+        )
         return True
 
     def connect_selected_pair(self) -> bool:
