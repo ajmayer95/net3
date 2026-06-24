@@ -42,6 +42,11 @@ dev = [
     "matplotlib",
     "jupyter",
 ]
+gui = [
+    "napari>=0.5",
+    "qtpy",
+    "PyQt5",
+]
 
 [project.scripts]
 net3 = "net3.cli:main"

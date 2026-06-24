@@ -42,6 +42,9 @@ mask_noisy.png
 mask_gapped.png
 example_mask.png
 example_overlay.png
+real_mask_demo.png
+real_mask_demo_v2.png
+real_mask_crop.png
 
 # Compiled Cython artefacts (re-built by `pip install -e .`)
 src/net3/*.so

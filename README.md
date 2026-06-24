@@ -160,6 +160,65 @@ Iterative visualisation is dramatically faster than guessing every flag right on
 
 Rule of thumb: for small or moderate masks, start with `--prune-order 0` and bump up only if you see spurs that `--prune-dangling --prune-dangling-min-length N` alone can't remove. For real microscopy data at the scale that PerTileFlow ships, 3–5 is fine.
 
+## Interactive editor
+
+For cleaning up false junctions, broken arms, and other vectorisation
+artifacts by hand, net3 ships a napari-based editor. Modernised port of
+[Jana Lasser's `gegui`](https://github.com/JanaLasser/network_extraction)
+(GPL-3, 2015, Python 2 / NetworkX 1.x) with a separable GUI-free
+backend.
+
+```bash
+pip install 'net3[gui]'            # adds napari + qtpy + PyQt5
+net3 edit graph.gpickle --mask mask.tif
+```
+
+Optional flags:
+
+- `--distance-map dm.png` — sample radius for newly-created nodes from
+  a precomputed distance transform (cv2.distanceTransform).
+- `--save out.gpickle` — Save target on `s` / button; defaults to
+  overwriting the input.
+
+### Controls
+
+| Action | Key | Mouse |
+|---|---|---|
+| Select / deselect node | — | Click near a node |
+| Create node | — | Shift + click on empty canvas |
+| Delete selected | `d` | — |
+| Connect two selected | `e` | — |
+| Highlight cycles | `m` | — |
+| Streamline (collapse degree-2) | `n` | — |
+| Clear selection | `c` | — |
+| Undo last edit | `z` | — |
+| Save | `s` | — |
+
+Node colors: **green** = degree-1 tip, **cyan** = degree-≥3 junction,
+**red** = intermediate, **yellow** = selected.
+
+### Backend API (no GUI)
+
+The editing operations live in `net3.edit.GraphEditor` — a plain
+Python class that wraps a NetworkX graph with selection state and an
+undo stack. Use it directly in scripts or notebooks:
+
+```python
+from net3.edit import GraphEditor
+
+ed = GraphEditor.from_gpickle("graph.gpickle")
+ed.select(42)
+ed.delete_selected()
+ed.add_node(120.5, 80.0)
+ed.connect_selected_pair()
+n_collapsed = ed.streamline()
+ed.undo()                  # restore the last mutation
+ed.save("edited.gpickle")
+```
+
+All operations have unit tests (`tests/test_edit_core.py`) that pass
+without napari installed.
+
 ## Caveats
 
 - Radii are distance-transform values at triangle centers. Good first-pass estimate; sub-pixel-accurate diameter requires per-edge refitting downstream.
