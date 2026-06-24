@@ -138,6 +138,9 @@ class _EditorApp:
         # whatever order we built the points array.  Used to map napari
         # selection indices back to graph node ids.
         self._node_index_order: List = []
+        # edge layer index → canonical (u,v); inverse map built lazily.
+        self._edge_index_order: List[Tuple] = []
+        self._edge_pair_to_index: dict = {}
 
         self._build_layers()
         self._build_dock(QPushButton, QLabel, QVBoxLayout, QWidget)
@@ -211,6 +214,7 @@ class _EditorApp:
         segments = []
         edge_colors = []
         edge_widths = []
+        edge_pairs: List[Tuple] = []
         G = self.editor.graph
         sel_edges = self.editor.selected_edges
         canon = GraphEditor._canonical_edge
@@ -223,12 +227,18 @@ class _EditorApp:
                 [self._image_h - yu, xu],
                 [self._image_h - yv, xv],
             ])
-            if canon(u, v) in sel_edges:
+            ck = canon(u, v)
+            edge_pairs.append(ck)
+            if ck in sel_edges:
                 edge_colors.append(EDGE_COLOR_SELECTED)
                 edge_widths.append(EDGE_WIDTH_SELECTED)
             else:
                 edge_colors.append(EDGE_COLOR)
                 edge_widths.append(EDGE_WIDTH)
+        # Maintain the index ↔ (u,v) maps so callers (click handler)
+        # can update one entry without rebuilding the whole layer.
+        self._edge_index_order = edge_pairs
+        self._edge_pair_to_index = {p: i for i, p in enumerate(edge_pairs)}
         if self._edges_layer is not None:
             try:
                 self.viewer.layers.remove(self._edges_layer)
@@ -255,6 +265,42 @@ class _EditorApp:
         self._refresh_edges_layer()
         self._refresh_nodes_layer()
         self._refresh_status()
+
+    def _update_edge_visual(self, u, v, selected: bool) -> None:
+        """Fast in-place update of a single edge's color/width without
+        rebuilding the whole Shapes layer.  At ~20k edges, a full
+        rebuild is several seconds; this is a microsecond op."""
+        if self._edges_layer is None:
+            return
+        key = GraphEditor._canonical_edge(u, v)
+        idx = self._edge_pair_to_index.get(key)
+        if idx is None:
+            return
+        # napari's Shapes layer accepts numpy arrays for these
+        # properties.  Mutating in-place + reassigning triggers a
+        # repaint of only the changed shape on its next frame.
+        try:
+            colors = np.asarray(self._edges_layer.edge_color).copy()
+            widths = np.asarray(self._edges_layer.edge_width).copy()
+            new_color = self._color_rgba(
+                EDGE_COLOR_SELECTED if selected else EDGE_COLOR)
+            new_width = (EDGE_WIDTH_SELECTED if selected else EDGE_WIDTH)
+            if colors.ndim == 2 and colors.shape[1] == 4:
+                colors[idx] = new_color
+            self._edges_layer.edge_color = colors
+            if widths.ndim == 1:
+                widths[idx] = new_width
+                self._edges_layer.edge_width = widths
+        except Exception:
+            # Fallback: rebuild the layer.
+            self._refresh_edges_layer()
+
+    @staticmethod
+    def _color_rgba(name: str):
+        """Convert a matplotlib-style colour name to a length-4 RGBA
+        array in [0, 1]."""
+        from matplotlib.colors import to_rgba
+        return np.asarray(to_rgba(name), dtype=float)
 
     # ── Build the dock widget ───────────────────────────────────
 
@@ -338,11 +384,16 @@ class _EditorApp:
             self._action_save()
 
         # Mouse model:
-        #   plain click       : toggle nearest node, fall back to nearest edge
-        #   Shift + click     : create new node at click (snap-to-centerline)
-        #   Control + drag    : rectangle select  (replaces current selection)
-        #   Control + Shift + drag : rectangle select, additive
-        #   plain drag        : pan (napari default — we don't intercept)
+        #   left click            : toggle nearest node, fall back to nearest edge
+        #   Shift + left click    : create new node at click (snap-to-centerline)
+        #   right click + drag    : rectangle select  (replaces current selection)
+        #   right click + Shift   : rectangle select, additive
+        #   left drag             : pan (napari default — we don't intercept)
+        #
+        # Why right-click for rect-select: napari's left-drag is bound
+        # to pan and intercepts any modifier we'd try to use to
+        # distinguish (Control/Alt/Meta).  Right-click is unbound by
+        # default, so our generator gets the events cleanly.
         @v.mouse_drag_callbacks.append
         def _on_press(viewer, event):
             yield from self._mouse_handler(event)
@@ -371,53 +422,50 @@ class _EditorApp:
 
     def _mouse_handler(self, event):
         """Generator that distinguishes click vs drag and dispatches
-        to the right action.  Yields once after the press; loops over
-        mouse_move events; on release decides click vs drag.
-        Suppresses napari's pan when Ctrl is held (drag-select)."""
-        if event.button != 1:  # only left button
+        to the right action.  Left = click/Shift-create; right = rect
+        select."""
+        if event.button not in (1, 2):
             return
         start = self._event_graph_xy(event)
         if start is None:
             return
-        ctrl = "Control" in event.modifiers
+        is_right = (event.button == 2)
         shift = "Shift" in event.modifiers
-        # If Ctrl is held, this is a drag-select gesture — show a live
-        # rubber-band rectangle until release.
         last = start
         moved = False
-        # Yield to let napari deliver mouse_move events.  The generator
-        # resumes for each one until release.
         yield
         while event.type == "mouse_move":
             now = self._event_graph_xy(event)
-            if now is None:
-                yield
-                continue
-            dx = now[0] - start[0]
-            dy = now[1] - start[1]
-            if (dx * dx + dy * dy) > (DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX):
-                moved = True
-            last = now
-            if ctrl and moved:
-                self._show_rubber_band(start, now)
+            if now is not None:
+                dx = now[0] - start[0]
+                dy = now[1] - start[1]
+                if (dx * dx + dy * dy) > (DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX):
+                    moved = True
+                last = now
+                if is_right and moved:
+                    self._show_rubber_band(start, now)
             yield
         # mouse_release
         end = last
         self._hide_rubber_band()
+        if is_right:
+            if moved:
+                self.editor.select_in_rect(
+                    start[0], start[1], end[0], end[1], additive=shift,
+                )
+                self._announce(
+                    f"rectangle-selected: {len(self.editor.selected)} "
+                    f"node(s)" + ("  (additive)" if shift else ""))
+                self._refresh_nodes_layer()
+                self._refresh_status()
+            else:
+                self._announce("(right-click — drag to rectangle-select)")
+                self._refresh_status()
+            return
+        # Left button: click or drag
         if not moved:
-            # Treat as click.
             self._handle_click(end[0], end[1], shift=shift)
-        elif ctrl:
-            # Drag-select rectangle.
-            self.editor.select_in_rect(
-                start[0], start[1], end[0], end[1], additive=shift,
-            )
-            n = sum(1 for _ in self.editor.selected)
-            self._announce(f"rectangle-selected: {n} node(s)")
-            self._refresh_nodes_layer()
-            self._refresh_status()
-        # else: plain drag without Ctrl → napari already panned; nothing
-        # for us to do.
+        # else: plain left-drag → napari already panned
 
     def _handle_click(self, gx: float, gy: float, shift: bool) -> None:
         tol = self._click_tolerance()
@@ -447,7 +495,10 @@ class _EditorApp:
             sel = (u, v) in self.editor.selected_edges
             self._announce(
                 f"edge ({u},{v}) {'selected' if sel else 'deselected'}")
-            self._refresh_edges_layer()
+            # Fast path: only update the single edge's visual, don't
+            # rebuild the whole Shapes layer.  At 20k edges, the full
+            # rebuild was the cause of the multi-second click lag.
+            self._update_edge_visual(u, v, sel)
             self._refresh_status()
             return
         self._announce(
@@ -574,10 +625,10 @@ class _EditorApp:
             f"<br><b>last:</b> {last}<br>"
             f"<br><b>save target:</b><br>{self.default_save_path}<br>"
             f"<br><b>mouse:</b><br>"
-            f"&nbsp;&nbsp;click = toggle nearest node/edge<br>"
-            f"&nbsp;&nbsp;Shift+click = create node (snapped)<br>"
-            f"&nbsp;&nbsp;Ctrl+drag = rectangle select<br>"
-            f"&nbsp;&nbsp;Ctrl+Shift+drag = additive"
+            f"&nbsp;&nbsp;left click = toggle nearest node/edge<br>"
+            f"&nbsp;&nbsp;Shift+left click = create node (snapped)<br>"
+            f"&nbsp;&nbsp;right click + drag = rectangle select<br>"
+            f"&nbsp;&nbsp;Shift+right click + drag = additive"
         )
         if self._status_lbl is not None:
             self._status_lbl.setText(text)

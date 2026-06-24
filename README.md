@@ -210,10 +210,10 @@ it'll print a hint with the right command to re-vectorise.
 
 | Action | Key | Mouse |
 |---|---|---|
-| Toggle nearest node OR edge | — | Click (node wins over edge if both in range) |
-| Create node (snap-to-centerline) | — | Shift + click on empty canvas |
-| Rectangle select (replace) | — | Ctrl + drag |
-| Rectangle select (additive) | — | Ctrl + Shift + drag |
+| Toggle nearest node OR edge | — | Left click (node wins over edge if both in range) |
+| Create node (snap-to-centerline) | — | Shift + left click on empty canvas |
+| Rectangle select (replace) | — | Right click + drag |
+| Rectangle select (additive) | — | Shift + right click + drag |
 | Delete selected nodes AND edges | `d` | — |
 | Connect two selected nodes | `e` | — |
 | Highlight cycles | `m` | — |
