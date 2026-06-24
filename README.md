@@ -7,27 +7,60 @@ per-edge radii in pixels.
 
 ## Install
 
+Requires **Python ≥ 3.9** and a working **C compiler** (the bundled
+Cython extension is compiled at install time):
+
+- macOS: `xcode-select --install`
+- Linux: a standard `gcc` (`build-essential` on Debian/Ubuntu)
+- Windows: MSVC Build Tools
+
+### One-step install (for users)
+
+Picks up the latest `main` from GitHub, builds the wheel, installs it
+into your current Python / venv. No source on disk.
+
 ```bash
-pip install -e .
+# base install (vectoriser + CLI only)
+pip install 'net3 @ git+https://github.com/ajmayer95/net3.git'
+
+# with the interactive editor (adds napari + qtpy + PyQt5, ~500 MB)
+pip install 'net3[gui] @ git+https://github.com/ajmayer95/net3.git'
 ```
 
-`pip install` automatically builds the bundled Cython extension
-(`C_net_functions`) — that's why `Cython` and `numpy` are listed under
-`[build-system].requires` in `pyproject.toml`. The build needs a working
-C compiler: on macOS `xcode-select --install` covers it, on Linux a
-standard `gcc` package, on Windows the MSVC Build Tools.
-
-If you're working in-place without a real install (e.g. on an HPC node
-where `pip install -e .` is awkward), you can build just the extension:
+A virtualenv is strongly recommended:
 
 ```bash
-python setup.py build_ext --inplace
-PYTHONPATH=src python -c "import net3; print(net3.__version__)"
+python -m venv .venv && source .venv/bin/activate
+pip install 'net3[gui] @ git+https://github.com/ajmayer95/net3.git'
 ```
 
-Other dependency worth flagging: `meshpy` wraps J. R. Shewchuk's Triangle
-library. macOS / Linux ship a wheel; Windows users may need a pre-built
-wheel from a third party.
+After install, `net3 --version` should print `net3 3.0.0`.
+
+### Editable / development install (for contributors)
+
+Use this if you want to **modify net3's source** (tweak defaults, add
+features, debug a failure mode). Edits to files under `src/net3/` then
+take effect immediately without reinstalling.
+
+```bash
+git clone https://github.com/ajmayer95/net3.git
+cd net3
+python -m venv .venv && source .venv/bin/activate
+pip install -e '.[gui,dev]'      # `dev` adds pytest + matplotlib + jupyter
+pytest -q                          # 32 tests should pass
+```
+
+### Notes
+
+- `meshpy` wraps J. R. Shewchuk's Triangle library. macOS / Linux ship
+  a wheel via pip; Windows users may need a pre-built wheel from a third
+  party.
+- On HPC nodes where `pip install` is awkward, you can build just the
+  Cython extension and run from a checkout:
+  ```bash
+  python setup.py build_ext --inplace
+  PYTHONPATH=src python -c "import net3; print(net3.__version__)"
+  ```
 
 ## Use — Python
 
