@@ -664,8 +664,21 @@ class _EditorApp:
         self._refresh_status()
 
     def _ensure_rect_tool_layer(self) -> None:
-        """Lazy-create the rectangle-drawing tool layer.  Wired to
-        `_on_rect_drawn` so a new shape triggers the selection."""
+        """Lazy-create the rectangle-drawing tool layer + register a
+        layer-level mouse_drag_callback that fires AFTER napari's
+        built-in add_rectangle generator finishes the drag.
+
+        Earlier versions listened for the layer's `events.set_data`
+        signal, but that fires DURING napari's add_rectangle generator
+        (between `layer.add(...)` and `layer.selected_data = {-1}`).
+        Clearing the layer from inside that signal left
+        napari trying to index `[-1]` of an empty list → IndexError.
+
+        Using a mouse_drag_callback on the layer itself lets us
+        process the just-finished rectangle from a clean state, and
+        clear it for the next drag without re-entering napari's
+        active generator.
+        """
         if self._rect_tool_layer is not None:
             return
         try:
@@ -676,55 +689,49 @@ class _EditorApp:
                 face_color="transparent",
                 opacity=0.5,
             )
-            self._rect_tool_layer.events.set_data.connect(self._on_rect_drawn)
+
+            @self._rect_tool_layer.mouse_drag_callbacks.append
+            def _on_layer_drag(layer, event):
+                yield from self._rect_layer_drag(layer, event)
+
         except Exception as e:
             print(f"  rect tool layer init failed: {e!r}")
             self._rect_tool_layer = None
 
-    def _on_rect_drawn(self, event=None) -> None:
-        """Triggered when napari's add_rectangle finishes a drag.
-        Reads the new shape, converts to graph coords, runs
-        select_in_rect, then clears the shape so the next drag starts
-        fresh."""
-        if self._rect_tool_handler_blocked:
+    def _rect_layer_drag(self, layer, event):
+        """Generator: runs alongside napari's add_rectangle to read
+        the finished rectangle and apply the selection."""
+        if self._mode != "rect" or event.button != 1:
             return
-        layer = self._rect_tool_layer
-        if layer is None or not layer.data:
+        start = self._event_graph_xy(event)
+        if start is None:
             return
-        rect = layer.data[-1]
-        if rect is None or len(rect) < 2:
+        shift = "Shift" in event.modifiers
+        yield  # let napari's add_rectangle press handler run
+        while event.type == "mouse_move":
+            yield
+        # mouse_release — napari just committed the rectangle, safe to read.
+        end = self._event_graph_xy(event)
+        if end is None:
             return
-        try:
-            arr = np.asarray(rect, dtype=float)
-            rows = arr[:, -2]
-            cols = arr[:, -1]
-            r0, r1 = float(rows.min()), float(rows.max())
-            c0, c1 = float(cols.min()), float(cols.max())
-        except Exception:
-            return
-        gx0, gx1 = c0, c1
-        gy0, gy1 = self._image_h - r0, self._image_h - r1
-        # Check Shift modifier via Qt for additive selection.
-        additive = False
-        try:
-            from qtpy.QtWidgets import QApplication
-            from qtpy.QtCore import Qt as _Qt
-            mods = QApplication.keyboardModifiers()
-            additive = bool(mods & _Qt.ShiftModifier)
-        except Exception:
-            pass
-        self.editor.select_in_rect(gx0, gy0, gx1, gy1, additive=additive)
-        self._announce(
-            f"rectangle-selected: {len(self.editor.selected)} node(s)"
-            + ("  (additive)" if additive else ""))
-        # Clear the temporary rectangle.  Suppress recursion: setting
-        # data fires set_data again; the flag short-circuits that.
-        self._rect_tool_handler_blocked = True
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        moved = (dx * dx + dy * dy) > (DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX)
+        if moved:
+            self.editor.select_in_rect(
+                start[0], start[1], end[0], end[1], additive=shift,
+            )
+            self._announce(
+                f"rectangle-selected: {len(self.editor.selected)} node(s)"
+                + ("  (additive)" if shift else ""))
+            self._refresh_selection_overlays()
+        # Always clean up the napari-drawn rectangle so the next drag
+        # starts from an empty layer.  Safe here because napari's
+        # add_rectangle generator has already returned.
         try:
             layer.data = []
-        finally:
-            self._rect_tool_handler_blocked = False
-        self._refresh_selection_overlays()
+        except Exception:
+            pass
         self._refresh_status()
 
     def _action_delete(self) -> None:
