@@ -65,16 +65,37 @@ def run_editor(
     Save target: ``save_path`` if provided, otherwise overwrite
     ``graph_path`` on Ctrl-S / button click (with a confirmation
     dialog).
+
+    Distance map fallback: if a mask is passed but no distance map is
+    provided, the editor computes one in-memory from the mask via
+    `cv2.distanceTransform` so newly-created nodes get a sensible
+    radius from the local distance-transform peak instead of the
+    default fallback.
     """
     editor = GraphEditor.from_gpickle(
         graph_path,
         mask_path=mask_path,
         distance_map_path=distance_map_path,
     )
+    if editor.distance_map is None and editor.mask is not None:
+        editor.distance_map = _distance_map_from_mask(editor.mask)
+        print("  computed distance map from mask "
+              f"(max radius {float(editor.distance_map.max()):.1f} px)")
     _maybe_warn_sparse(editor)
     app = _EditorApp(editor,
                       default_save_path=Path(save_path or graph_path))
     app.run()
+
+
+def _distance_map_from_mask(mask):
+    """Compute a distance transform of `mask` so newly-created nodes
+    can sample radius from it.  Uses OpenCV's L2 transform (matches
+    what `pertile/vectorize/image.py` produces, so radii read out are
+    in the same units as the graph's existing radius attributes)."""
+    import cv2
+    import numpy as np
+    bw = (mask > 127).astype(np.uint8) if mask.dtype != bool else mask.astype(np.uint8)
+    return cv2.distanceTransform(bw, cv2.DIST_L2, 5).astype(np.float32)
     return editor
 
 
