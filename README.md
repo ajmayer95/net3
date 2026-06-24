@@ -17,50 +17,63 @@ Cython extension is compiled at install time):
 ### One-step install (for users)
 
 Picks up the latest `main` from GitHub, builds the wheel, installs it
-into your current Python / venv. No source on disk.
+into your current Python / venv. No source on disk afterwards.
+
+Recommended: do it in a fresh virtualenv so net3's deps don't mix with
+your system Python. The `[gui]` extra adds napari + qtpy + PyQt5 for
+the interactive editor (~500 MB; takes a few minutes the first time).
 
 ```bash
-# base install (vectoriser + CLI only)
+mkdir -p ~/net3 && cd ~/net3
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install 'net3[gui] @ git+https://github.com/ajmayer95/net3.git'
+```
+
+If you don't need the editor, drop the `[gui]` part:
+
+```bash
 pip install 'net3 @ git+https://github.com/ajmayer95/net3.git'
-
-# with the interactive editor (adds napari + qtpy + PyQt5, ~500 MB)
-pip install 'net3[gui] @ git+https://github.com/ajmayer95/net3.git'
 ```
 
-A virtualenv is strongly recommended:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install 'net3[gui] @ git+https://github.com/ajmayer95/net3.git'
-```
-
-After install, `net3 --version` should print `net3 3.0.0`.
+After either install, `net3 --version` should print `net3 3.0.0`.
 
 ### Editable / development install (for contributors)
 
 Use this if you want to **modify net3's source** (tweak defaults, add
 features, debug a failure mode). Edits to files under `src/net3/` then
-take effect immediately without reinstalling.
+take effect immediately without reinstalling. The `dev` extra adds
+`pytest`, `matplotlib`, `jupyter`.
 
 ```bash
 git clone https://github.com/ajmayer95/net3.git
 cd net3
-python -m venv .venv && source .venv/bin/activate
-pip install -e '.[gui,dev]'      # `dev` adds pytest + matplotlib + jupyter
-pytest -q                          # 32 tests should pass
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e '.[gui,dev]'
+pytest -q
 ```
+
+The test suite should report 32 passed.
 
 ### Notes
 
 - `meshpy` wraps J. R. Shewchuk's Triangle library. macOS / Linux ship
   a wheel via pip; Windows users may need a pre-built wheel from a third
   party.
-- On HPC nodes where `pip install` is awkward, you can build just the
-  Cython extension and run from a checkout:
-  ```bash
-  python setup.py build_ext --inplace
-  PYTHONPATH=src python -c "import net3; print(net3.__version__)"
-  ```
+- **zsh users**: paste each block as a whole. Don't add inline `# ...`
+  comments to lines — stock macOS zsh treats `#` as a literal argument,
+  not a comment, so e.g. `pip install foo  # bar` makes pip try to
+  install a package literally called `#`.
+- On HPC nodes where `pip install` is awkward, build just the Cython
+  extension and run from a checkout:
+
+```bash
+python setup.py build_ext --inplace
+PYTHONPATH=src python -c "import net3; print(net3.__version__)"
+```
 
 ## Use — Python
 
@@ -201,8 +214,16 @@ artifacts by hand, net3 ships a napari-based editor. Modernised port of
 (GPL-3, 2015, Python 2 / NetworkX 1.x) with a separable GUI-free
 backend.
 
+If you didn't install the `[gui]` extra earlier, do it now (adds napari
++ qtpy + PyQt5):
+
 ```bash
-pip install 'net3[gui]'            # adds napari + qtpy + PyQt5
+pip install 'net3[gui] @ git+https://github.com/ajmayer95/net3.git'
+```
+
+Then open the editor on an existing graph + its source mask:
+
+```bash
 net3 edit graph.gpickle --mask mask.tif
 ```
 
@@ -223,18 +244,22 @@ across the mask instead of tracing it.
 
 For the editor, vectorise with **`--for-editor`** (shorthand for
 `--remove-redundant none`). The polyline of short edges then traces
-the mask centerline closely:
+the mask centerline closely. Three-step workflow:
+
+**1.** Vectorise in editor-friendly form (keeps every intermediate node):
 
 ```bash
-# 1. Vectorise in editor-friendly form (keeps every intermediate node)
 net3 vectorize mask.tif -o graph_edit.gpickle --for-editor
-
-# 2. Edit interactively (clean up false junctions, broken arms, ...)
-net3 edit graph_edit.gpickle --mask mask.tif --save graph_edit.gpickle
-
-# 3. Collapse to topological form for analysis: press `n` in the editor
-#    before saving, OR run a second vectorise pass without --for-editor.
 ```
+
+**2.** Edit interactively (clean up false junctions, broken arms, ...):
+
+```bash
+net3 edit graph_edit.gpickle --mask mask.tif --save graph_edit.gpickle
+```
+
+**3.** Collapse to topological form for analysis: press `n` in the editor
+before saving, OR run a second vectorise pass without `--for-editor`.
 
 If you launch the editor on a graph that's already been streamlined,
 it'll print a hint with the right command to re-vectorise.
