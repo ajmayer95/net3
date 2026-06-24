@@ -396,7 +396,14 @@ class GraphEditor:
         length = math.hypot(xu - xv, yu - yv)
         ru = float(self.graph.nodes[u].get("radius", self.DEFAULT_RADIUS))
         rv = float(self.graph.nodes[v].get("radius", self.DEFAULT_RADIUS))
-        path = np.array([[xu, yu], [xv, yv]], dtype=float)
+        # Densify the straight-line path so downstream consumers that
+        # require N>=5 sample points (e.g. PerTileFlow's `get_chain_coords`,
+        # which rejects edges with len(coords) < 5) accept editor-added
+        # edges.  ~1 sample every 2 px, min 5, max 200.
+        n_samples = int(np.clip(round(length / 2.0), 5, 200))
+        ts = np.linspace(0.0, 1.0, n_samples)
+        path = np.column_stack([xu + ts * (xv - xu),
+                                  yu + ts * (yv - yu)])
         self.graph.add_edge(
             u, v,
             weight=length,
