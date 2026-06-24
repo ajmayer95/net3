@@ -134,10 +134,12 @@ of each failure mode.
 
 ### Example commands
 
+All three use `test_mask.png` from Quick Start above so they run as-is.
+
 Fine-scale data with small features:
 
 ```bash
-net3 vectorize mask.tif -o g.gpickle --min-feature-size 200 --prune-order 3
+net3 vectorize test_mask.png -o g_fine.gpickle --min-feature-size 200 --prune-order 3
 ```
 
 Noisy segmentation with small gaps and ragged boundaries — bridge the
@@ -145,13 +147,24 @@ gaps, smooth the boundary, then prune the short spurs the boundary
 roughness left behind:
 
 ```bash
-net3 vectorize mask.tif -o g.gpickle --bridge-gaps 10 --smoothing 2 --prune-dangling --prune-dangling-min-length 30
+net3 vectorize test_mask.png -o g_noisy.gpickle --bridge-gaps 10 --smoothing 2 --prune-dangling --prune-dangling-min-length 30
 ```
 
-Coarse "main branches only" graph for a large dense network:
+Coarse "main branches only" graph for a large dense network (won't
+leave much standing on this small test mask — that's the point of
+the flag combo on the wrong data):
 
 ```bash
-net3 vectorize mask.tif -o g.gpickle --min-feature-size 8000 --prune-order 12 --prune-dangling --prune-dangling-min-length 80
+net3 vectorize test_mask.png -o g_coarse.gpickle --min-feature-size 8000 --prune-order 12 --prune-dangling --prune-dangling-min-length 80
+```
+
+Compare the three outputs in Python:
+
+```python
+import pickle
+for name in ('g_fine', 'g_noisy', 'g_coarse'):
+    G = pickle.load(open(f'{name}.gpickle', 'rb'))
+    print(f'{name}: {G.number_of_nodes()}n {G.number_of_edges()}e')
 ```
 
 ### A gotcha worth knowing
