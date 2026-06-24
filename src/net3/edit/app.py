@@ -139,7 +139,13 @@ class _EditorApp:
         self._edges_layer = None
         self._sel_nodes_overlay = None
         self._sel_edges_overlay = None
-        self._rubber_band_layer = None
+        self._rubber_band_layer = None  # (legacy, kept for fallback)
+        # Tool layer for rectangle drag-select.  Goes into napari's
+        # 'add_rectangle' mode when Rect-Select mode is active — that
+        # automatically suppresses pan (which is the default left-drag
+        # behaviour and can't be cancelled from a mouse_drag_callback).
+        self._rect_tool_layer = None
+        self._rect_tool_handler_blocked = False
         # Mode state
         self._mode: str = "select"   # "select" | "rect" | "add"
         # Stable ordering for the points layer — backend node ids in
@@ -496,14 +502,19 @@ class _EditorApp:
         return col, self._image_h - row
 
     def _mouse_handler(self, event):
-        """Mode-aware mouse handler.
+        """Mode-aware mouse handler for Select / Add-Node modes.
 
-        - Select / Add-Node modes: left click does the click action;
-          left drag is left for napari to pan.
-        - Rect-Select mode: left drag draws a rubber band and selects
-          nodes inside on release.  Shift = additive.
+        Rect-Select is NOT handled here — it uses napari's built-in
+        Shapes 'add_rectangle' mode, which intercepts the drag at the
+        layer level (so pan is suppressed automatically).  See
+        `_set_mode` and `_on_rect_drawn`.
         """
         if event.button != 1:
+            return
+        if self._mode == "rect":
+            # Hand the drag to napari's add_rectangle.  Returning
+            # without yielding lets napari's default layer handlers
+            # see the event.
             return
         start = self._event_graph_xy(event)
         if start is None:
@@ -511,7 +522,6 @@ class _EditorApp:
         shift = "Shift" in event.modifiers
         last = start
         moved = False
-        is_rect_mode = (self._mode == "rect")
         yield
         while event.type == "mouse_move":
             now = self._event_graph_xy(event)
@@ -521,32 +531,10 @@ class _EditorApp:
                 if (dx * dx + dy * dy) > (DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX):
                     moved = True
                 last = now
-                if is_rect_mode and moved:
-                    self._show_rubber_band(start, now)
             yield
-        # mouse_release
         end = last
-        self._hide_rubber_band()
-        if is_rect_mode:
-            if moved:
-                self.editor.select_in_rect(
-                    start[0], start[1], end[0], end[1], additive=shift,
-                )
-                self._announce(
-                    f"rectangle-selected: {len(self.editor.selected)} "
-                    f"node(s)" + ("  (additive)" if shift else ""))
-                self._refresh_selection_overlays()
-                self._refresh_status()
-            else:
-                # Click while in rect mode → treat as a normal click so
-                # users can still toggle individual nodes/edges without
-                # leaving the mode.
-                self._handle_click(end[0], end[1], shift=shift)
-            return
-        # Select / Add-Node modes
         if not moved:
             self._handle_click(end[0], end[1], shift=shift)
-        # else: left-drag in non-rect mode → napari panned, nothing to do
 
     def _handle_click(self, gx: float, gy: float, shift: bool) -> None:
         tol = self._click_tolerance()
@@ -632,20 +620,111 @@ class _EditorApp:
 
     def _set_mode(self, mode: str) -> None:
         """Switch input mode.  Updates which dock button is highlighted
-        and which mouse behavior the handler uses."""
+        and which mouse behavior the handler uses.
+
+        Rect-Select uses napari's built-in Shapes 'add_rectangle' mode
+        on a dedicated tool layer — when that layer is active and in
+        add_rectangle mode, napari swallows the left-drag (no pan) and
+        draws a live rectangle preview itself.
+        """
         if mode not in ("select", "rect", "add"):
             return
         self._mode = mode
-        # Sync the button checked-state (uncheck others, check this).
         for k, b in self._mode_btns.items():
             try:
                 b.setChecked(k == mode)
+            except Exception:
+                pass
+        self._ensure_rect_tool_layer()
+        if mode == "rect" and self._rect_tool_layer is not None:
+            try:
+                self._rect_tool_layer.mode = "add_rectangle"
+                self.viewer.layers.selection.active = self._rect_tool_layer
+            except Exception as e:
+                print(f"  rect mode setup failed: {e!r}")
+        else:
+            # Restore the rect-tool layer to pan_zoom so pan works
+            # normally.  Make a non-shapes layer active so subsequent
+            # clicks aren't intercepted by the (now-inactive) tool.
+            if self._rect_tool_layer is not None:
+                try:
+                    self._rect_tool_layer.mode = "pan_zoom"
+                except Exception:
+                    pass
+            # Prefer the nodes layer as active in Select / Add modes.
+            try:
+                if self._nodes_layer is not None:
+                    self.viewer.layers.selection.active = self._nodes_layer
             except Exception:
                 pass
         label = {"select": "Select",
                   "rect": "Rect-Select",
                   "add": "Add Node"}[mode]
         self._announce(f"mode → {label}")
+        self._refresh_status()
+
+    def _ensure_rect_tool_layer(self) -> None:
+        """Lazy-create the rectangle-drawing tool layer.  Wired to
+        `_on_rect_drawn` so a new shape triggers the selection."""
+        if self._rect_tool_layer is not None:
+            return
+        try:
+            self._rect_tool_layer = self.viewer.add_shapes(
+                name="rect tool",
+                edge_color=RUBBER_BAND_COLOR,
+                edge_width=2,
+                face_color="transparent",
+                opacity=0.5,
+            )
+            self._rect_tool_layer.events.set_data.connect(self._on_rect_drawn)
+        except Exception as e:
+            print(f"  rect tool layer init failed: {e!r}")
+            self._rect_tool_layer = None
+
+    def _on_rect_drawn(self, event=None) -> None:
+        """Triggered when napari's add_rectangle finishes a drag.
+        Reads the new shape, converts to graph coords, runs
+        select_in_rect, then clears the shape so the next drag starts
+        fresh."""
+        if self._rect_tool_handler_blocked:
+            return
+        layer = self._rect_tool_layer
+        if layer is None or not layer.data:
+            return
+        rect = layer.data[-1]
+        if rect is None or len(rect) < 2:
+            return
+        try:
+            arr = np.asarray(rect, dtype=float)
+            rows = arr[:, -2]
+            cols = arr[:, -1]
+            r0, r1 = float(rows.min()), float(rows.max())
+            c0, c1 = float(cols.min()), float(cols.max())
+        except Exception:
+            return
+        gx0, gx1 = c0, c1
+        gy0, gy1 = self._image_h - r0, self._image_h - r1
+        # Check Shift modifier via Qt for additive selection.
+        additive = False
+        try:
+            from qtpy.QtWidgets import QApplication
+            from qtpy.QtCore import Qt as _Qt
+            mods = QApplication.keyboardModifiers()
+            additive = bool(mods & _Qt.ShiftModifier)
+        except Exception:
+            pass
+        self.editor.select_in_rect(gx0, gy0, gx1, gy1, additive=additive)
+        self._announce(
+            f"rectangle-selected: {len(self.editor.selected)} node(s)"
+            + ("  (additive)" if additive else ""))
+        # Clear the temporary rectangle.  Suppress recursion: setting
+        # data fires set_data again; the flag short-circuits that.
+        self._rect_tool_handler_blocked = True
+        try:
+            layer.data = []
+        finally:
+            self._rect_tool_handler_blocked = False
+        self._refresh_selection_overlays()
         self._refresh_status()
 
     def _action_delete(self) -> None:
