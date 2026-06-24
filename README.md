@@ -1,27 +1,11 @@
 # net3
 
-Binary mask → NetworkX graph. Given a segmentation of any tubular
-network, `net3` extracts a graph with node coordinates, edge lengths,
-and per-edge radii in pixels. Ships with an interactive napari-based
-editor for cleaning up false junctions and broken arms by hand.
+Binary mask → NetworkX graph + interactive napari-based editor.
 
 ## Install
 
-Requires **Python ≥ 3.9** and a working **C compiler** (the bundled
-Cython extension is compiled at install time):
-
-- macOS: `xcode-select --install`
-- Linux: a standard `gcc` (`build-essential` on Debian/Ubuntu)
-- Windows: MSVC Build Tools
-
-### One-step install (for users)
-
-Picks up the latest `main` from GitHub, builds the wheel, installs it
-into your current Python / venv. No source on disk afterwards.
-
-Recommended: do it in a fresh virtualenv so net3's deps don't mix with
-your system Python. The `[gui]` extra adds napari + qtpy + PyQt5 for
-the interactive editor (~500 MB; takes a few minutes the first time).
+Needs Python ≥ 3.9 + a C compiler (`xcode-select --install` on macOS;
+`build-essential` on Debian/Ubuntu; MSVC Build Tools on Windows).
 
 ```bash
 mkdir -p ~/net3 && cd ~/net3
@@ -31,20 +15,53 @@ pip install --upgrade pip
 pip install 'net3[gui] @ git+https://github.com/ajmayer95/net3.git'
 ```
 
-If you don't need the editor, drop the `[gui]` part:
+Test:
 
 ```bash
-pip install 'net3 @ git+https://github.com/ajmayer95/net3.git'
+net3 --version
 ```
 
-After either install, `net3 --version` should print `net3 3.0.0`.
+## Try it
 
-### Editable / development install (for contributors)
+Download a sample mask, vectorise it, open in the editor:
 
-Use this if you want to **modify net3's source** (tweak defaults, add
-features, debug a failure mode). Edits to files under `src/net3/` then
-take effect immediately without reinstalling. The `dev` extra adds
-`pytest`, `matplotlib`, `jupyter`.
+```bash
+curl -L https://raw.githubusercontent.com/JanaLasser/network_extraction/master/data/binaries/tracheole1_binary.png -o test_mask.png
+net3 vectorize test_mask.png -o test_graph.gpickle --min-feature-size 200 --for-editor
+net3 edit test_graph.gpickle --mask test_mask.png
+```
+
+A napari window opens with the mask in greyscale + an orange polyline
+tracing every branch (red dots at intermediate nodes, green at tips,
+cyan at junctions). Click around, press `m` to highlight cycles, close
+to exit.
+
+That's it — net3 works on your machine.
+
+---
+
+Everything below is reference material for tuning parameters, the
+Python API, the editor's full keyboard cheatsheet, and the developer
+install. Read it when you hit a specific question, not start-to-finish.
+
+---
+
+## Two forms of the graph
+
+`net3 vectorize` produces one of two shapes depending on `--for-editor`:
+
+- **Topological** (default): every node is a tip or junction. Edges
+  are straight lines between them. Right form for graph analysis;
+  visually confusing in the editor because edges cut across the mask.
+- **Centerline** (`--for-editor`): every intermediate node kept.
+  Polyline traces the mask. Right form for the editor.
+
+If you need both — edit the centerline form, then press `n`
+(streamline) in the editor before saving to collapse to topological.
+
+## Developer install
+
+If you want to modify net3's source:
 
 ```bash
 git clone https://github.com/ajmayer95/net3.git
@@ -56,70 +73,8 @@ pip install -e '.[gui,dev]'
 pytest -q
 ```
 
-The test suite should report 32 passed.
-
-### Notes
-
-- `meshpy` wraps J. R. Shewchuk's Triangle library. macOS / Linux ship
-  a wheel via pip; Windows users may need a pre-built wheel from a third
-  party.
-- **zsh users**: paste each block as a whole. Don't add inline `# ...`
-  comments to lines — stock macOS zsh treats `#` as a literal argument,
-  not a comment, so e.g. `pip install foo  # bar` makes pip try to
-  install a package literally called `#`.
-- On HPC nodes where `pip install` is awkward, build just the Cython
-  extension and run from a checkout:
-
-```bash
-python setup.py build_ext --inplace
-PYTHONPATH=src python -c "import net3; print(net3.__version__)"
-```
-
-## Quick start (CLI)
-
-Run from the venv where you just installed net3. The example downloads
-a small test mask so the commands are runnable as-is.
-
-Download a sample mask:
-
-```bash
-curl -L https://raw.githubusercontent.com/JanaLasser/network_extraction/master/data/binaries/tracheole1_binary.png -o test_mask.png
-```
-
-Vectorise it in **editor-friendly form** — keeps every intermediate
-node so the polyline traces the mask centerline. This is what you
-want as a first run to see what the algorithm is doing.
-
-```bash
-net3 vectorize test_mask.png -o test_graph.gpickle --min-feature-size 200 --for-editor
-```
-
-You should see stage-by-stage progress ending with something like
-`Wrote 3055 nodes, 3057 edges → test_graph.gpickle`.
-
-Open it in the interactive editor (needs `[gui]` extra installed):
-
-```bash
-net3 edit test_graph.gpickle --mask test_mask.png
-```
-
-You'll see the mask with an orange polyline tracing every branch.
-
-**Without `--for-editor`** you get the topological form instead —
-every node is a tip or junction, edges are straight lines connecting
-them, no intermediates. That's the right form for downstream graph
-analysis but visually confusing (edges cut across the mask):
-
-```bash
-net3 vectorize test_mask.png -o test_graph_topo.gpickle --min-feature-size 200
-```
-
-You can also start in editor-friendly form, edit by hand, then press
-`n` (streamline) inside the editor before saving to collapse back to
-topological form. See the [Recommended workflow](#recommended-workflow)
-section below.
-
-`net3 --help` and `net3 vectorize --help` list every flag.
+Edits to `src/net3/` take effect immediately. `pytest -q` reports 32
+passed.
 
 ## Use from Python
 
