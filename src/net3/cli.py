@@ -79,6 +79,14 @@ def _add_vectorize_args(parser: argparse.ArgumentParser) -> None:
               "--prune-dangling is on. Default: 0."),
     )
     parser.add_argument(
+        "--for-editor", action="store_true",
+        help=("Shorthand for `--remove-redundant none`.  Keeps every "
+              "intermediate triangle-center node so straight-line "
+              "edges trace the mask centerline — the form the "
+              "interactive editor (`net3 edit`) expects.  Overrides "
+              "--remove-redundant if both are given."),
+    )
+    parser.add_argument(
         "-q", "--quiet", action="store_true",
         help="Suppress per-stage progress logging.",
     )
@@ -89,6 +97,7 @@ def _run_vectorize(args: argparse.Namespace) -> int:
         print(f"error: mask not found: {args.mask}", file=sys.stderr)
         return 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    remove_redundant = "none" if args.for_editor else args.remove_redundant
     G = vectorize(
         str(args.mask),
         min_feature_size=args.min_feature_size,
@@ -96,7 +105,7 @@ def _run_vectorize(args: argparse.Namespace) -> int:
         bridge_gaps=args.bridge_gaps,
         invert=args.invert,
         prune_order=args.prune_order,
-        remove_redundant=args.remove_redundant,
+        remove_redundant=remove_redundant,
         prune_dangling=args.prune_dangling,
         prune_dangling_min_length=args.prune_dangling_min_length,
         verbose=not args.quiet,

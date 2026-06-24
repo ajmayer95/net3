@@ -60,10 +60,36 @@ def run_editor(
         mask_path=mask_path,
         distance_map_path=distance_map_path,
     )
+    _maybe_warn_sparse(editor)
     app = _EditorApp(editor,
                       default_save_path=Path(save_path or graph_path))
     app.run()
     return editor
+
+
+def _maybe_warn_sparse(editor: GraphEditor) -> None:
+    """Print a hint when the loaded graph has so few degree-2 nodes
+    that straight-line edges will cut across the mask instead of
+    tracing its centerline.  This happens when a graph was vectorised
+    with `remove_redundant='all'` — fine for topology, but visually
+    misleading in an interactive editor."""
+    if editor.n_nodes == 0:
+        return
+    deg2 = sum(1 for _, d in editor.graph.degree() if d == 2)
+    deg2_frac = deg2 / editor.n_nodes
+    # < 5% degree-2 nodes is the "topologically collapsed" regime.
+    if deg2_frac < 0.05:
+        import sys
+        print(
+            "\nnet3 edit: heads-up — this graph has only "
+            f"{deg2}/{editor.n_nodes} degree-2 nodes "
+            f"({deg2_frac:.1%}).  Straight-line edges between "
+            "junctions and tips will cut across the mask instead of "
+            "tracing it.  To get a graph that visibly follows the "
+            "centerline, re-vectorise with:\n"
+            "    net3 vectorize MASK -o GRAPH --for-editor\n",
+            file=sys.stderr,
+        )
 
 
 # ── Frontend wiring ───────────────────────────────────────────────

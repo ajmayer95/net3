@@ -180,6 +180,32 @@ Optional flags:
 - `--save out.gpickle` — Save target on `s` / button; defaults to
   overwriting the input.
 
+### Recommended workflow
+
+`net3 vectorize` defaults to `--remove-redundant all`, which gives a
+clean topology graph (every node is a tip or junction). That's the
+right form for downstream analysis, but it's visually confusing in the
+editor — edges become straight lines connecting tips/junctions and cut
+across the mask instead of tracing it.
+
+For the editor, vectorise with **`--for-editor`** (shorthand for
+`--remove-redundant none`). The polyline of short edges then traces
+the mask centerline closely:
+
+```bash
+# 1. Vectorise in editor-friendly form (keeps every intermediate node)
+net3 vectorize mask.tif -o graph_edit.gpickle --for-editor
+
+# 2. Edit interactively (clean up false junctions, broken arms, ...)
+net3 edit graph_edit.gpickle --mask mask.tif --save graph_edit.gpickle
+
+# 3. Collapse to topological form for analysis: press `n` in the editor
+#    before saving, OR run a second vectorise pass without --for-editor.
+```
+
+If you launch the editor on a graph that's already been streamlined,
+it'll print a hint with the right command to re-vectorise.
+
 ### Controls
 
 | Action | Key | Mouse |
