@@ -1,0 +1,5 @@
+# Tools that read commit history (GitHub UI, `git log`, `git shortlog`)
+# rewrite author entries through this file.  Used here to fix early
+# commits where I had the author's first name wrong (Adam → Alex) —
+# the actual commit objects are unchanged; only the display is.
+Alex Mayer <ajmayer95@gmail.com> Adam Mayer <ajmayer95@gmail.com>
