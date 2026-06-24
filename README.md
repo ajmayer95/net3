@@ -21,10 +21,13 @@ net3 --version
 
 ## Try it
 
+A sample mask ships with the repo at `data/sample_mask.tif`. Pull it
+down and run the pipeline:
+
 ```bash
-curl -L https://raw.githubusercontent.com/JanaLasser/network_extraction/master/data/binaries/tracheole1_binary.png -o test_mask.png
-net3 vectorize test_mask.png -o test_graph.gpickle --min-feature-size 200 --for-editor
-net3 edit test_graph.gpickle --mask test_mask.png
+curl -L https://raw.githubusercontent.com/ajmayer95/net3/main/data/sample_mask.tif -o sample_mask.tif
+net3 vectorize sample_mask.tif -o sample_graph.gpickle --for-editor
+net3 edit sample_graph.gpickle --mask sample_mask.tif
 ```
 
 A napari window opens with the mask in greyscale and an orange polyline
