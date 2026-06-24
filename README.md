@@ -86,20 +86,38 @@ Download a sample mask:
 curl -L https://raw.githubusercontent.com/JanaLasser/network_extraction/master/data/binaries/tracheole1_binary.png -o test_mask.png
 ```
 
-Vectorise it:
+Vectorise it in **editor-friendly form** — keeps every intermediate
+node so the polyline traces the mask centerline. This is what you
+want as a first run to see what the algorithm is doing.
 
 ```bash
-net3 vectorize test_mask.png -o test_graph.gpickle --min-feature-size 200
+net3 vectorize test_mask.png -o test_graph.gpickle --min-feature-size 200 --for-editor
 ```
 
 You should see stage-by-stage progress ending with something like
-`Wrote 50 nodes, 49 edges → test_graph.gpickle`.
+`Wrote 3055 nodes, 3057 edges → test_graph.gpickle`.
 
 Open it in the interactive editor (needs `[gui]` extra installed):
 
 ```bash
 net3 edit test_graph.gpickle --mask test_mask.png
 ```
+
+You'll see the mask with an orange polyline tracing every branch.
+
+**Without `--for-editor`** you get the topological form instead —
+every node is a tip or junction, edges are straight lines connecting
+them, no intermediates. That's the right form for downstream graph
+analysis but visually confusing (edges cut across the mask):
+
+```bash
+net3 vectorize test_mask.png -o test_graph_topo.gpickle --min-feature-size 200
+```
+
+You can also start in editor-friendly form, edit by hand, then press
+`n` (streamline) inside the editor before saving to collapse back to
+topological form. See the [Recommended workflow](#recommended-workflow)
+section below.
 
 `net3 --help` and `net3 vectorize --help` list every flag.
 
