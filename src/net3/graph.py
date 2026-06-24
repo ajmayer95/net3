@@ -326,13 +326,15 @@ def _trace_vessel_chain(G: nx.Graph, start, nbr):
     return path
 
 
-def collapse_to_vessel_graph(G: nx.Graph, verbose: bool = False) -> nx.Graph:
+def collapse_to_branch_graph(G: nx.Graph, verbose: bool = False) -> nx.Graph:
     """
-    Collapse dense graph to vessel graph (one edge per vessel).
+    Collapse a dense (every-intermediate-node) graph into a branch
+    graph: one edge per branch between successive junctions/tips, with
+    the full intermediate path geometry stored as an edge attribute.
 
-    Each edge in the output represents a complete vessel segment between
-    junctions (nodes with degree != 2). The path geometry is preserved
-    as an edge attribute for visualization and kymograph extraction.
+    Each edge in the output represents a complete branch between
+    non-degree-2 nodes.  The path geometry is preserved as an edge
+    attribute for visualisation and downstream per-segment analysis.
 
     Parameters
     ----------
@@ -344,7 +346,7 @@ def collapse_to_vessel_graph(G: nx.Graph, verbose: bool = False) -> nx.Graph:
     Returns
     -------
     nx.Graph
-        Vessel graph where each edge has:
+        Branch graph where each edge has:
         - 'path': np.ndarray of shape (N, 2) with (x, y) coordinates
         - 'radii': np.ndarray of shape (N,) with radius at each path point
         - 'length': total arc length of the vessel
