@@ -129,7 +129,30 @@ Run with defaults first, visualise the result, then diagnose:
 - **Branches broken into pieces** → add `--bridge-gaps 10`, or check whether `--invert` is needed.
 - **Real branches missing** → `--min-feature-size` is too high, or `--smoothing` is eroding them.
 
-For fine-scale data, drop `--min-feature-size` to ~200 and `--prune-order` to 3. For noisy mask boundaries, add `--smoothing 2`. Run `examples/tuning_walkthrough.py` after install for visual examples of each failure mode.
+Run `examples/tuning_walkthrough.py` after install for visual examples
+of each failure mode.
+
+### Example commands
+
+Fine-scale data with small features:
+
+```bash
+net3 vectorize mask.tif -o g.gpickle --min-feature-size 200 --prune-order 3
+```
+
+Noisy segmentation with small gaps and ragged boundaries — bridge the
+gaps, smooth the boundary, then prune the short spurs the boundary
+roughness left behind:
+
+```bash
+net3 vectorize mask.tif -o g.gpickle --bridge-gaps 10 --smoothing 2 --prune-dangling --prune-dangling-min-length 30
+```
+
+Coarse "main branches only" graph for a large dense network:
+
+```bash
+net3 vectorize mask.tif -o g.gpickle --min-feature-size 8000 --prune-order 12 --prune-dangling --prune-dangling-min-length 80
+```
 
 ### A gotcha worth knowing
 
