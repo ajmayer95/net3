@@ -79,10 +79,13 @@ def test_add_node_with_default_radius():
 
 
 def test_add_node_samples_distance_map():
+    # Distance map is in image-row convention; graph y is math-y
+    # (y = H - row).  A dmap value at row 3 col 5 should be sampled
+    # when the user passes graph coords (x=5, y=H-3=7).
     dmap = np.zeros((10, 10), dtype=np.float32)
     dmap[3, 5] = 7.5
     ed = GraphEditor(_toy_graph(), distance_map=dmap)
-    n = ed.add_node(5.0, 3.0)
+    n = ed.add_node(5.0, 7.0)
     assert ed.graph.nodes[n]["radius"] == pytest.approx(7.5)
 
 
@@ -232,3 +235,118 @@ def test_save_round_trip(tmp_path):
     G2 = GraphEditor.from_gpickle(out).graph
     assert G2.number_of_nodes() == 6
     assert G2.number_of_edges() == 5
+
+
+# ── Edge hit-testing ──────────────────────────────────────────────
+
+
+def test_edge_at_finds_nearest_segment():
+    ed = GraphEditor(_toy_graph())
+    # Edge 0-1 runs from (0,0) to (1,0). Point near the segment middle
+    # at (0.5, 0.1) is well inside tol=0.5.
+    hit = ed.edge_at(0.5, 0.1, tolerance=0.5)
+    assert hit == (0, 1)
+    # Click far from any edge → None.
+    assert ed.edge_at(10, 10, tolerance=0.5) is None
+
+
+def test_edge_at_returns_canonical_order():
+    ed = GraphEditor(_toy_graph())
+    # Whatever edge is closest to (2.5, 0.1) — segment 2-3 — should be
+    # returned in (min, max) order regardless of internal nx order.
+    hit = ed.edge_at(2.5, 0.1, tolerance=0.5)
+    assert hit == (2, 3)
+
+
+# ── Edge selection ────────────────────────────────────────────────
+
+
+def test_select_and_toggle_edge():
+    ed = GraphEditor(_toy_graph())
+    assert ed.select_edge(0, 1) is True
+    assert (0, 1) in ed.selected_edges
+    ed.toggle_edge_selection(1, 0)  # order-insensitive
+    assert (0, 1) not in ed.selected_edges
+    ed.toggle_edge_selection(0, 1)
+    assert (0, 1) in ed.selected_edges
+
+
+def test_select_edge_refuses_missing():
+    ed = GraphEditor(_toy_graph())
+    assert ed.select_edge(0, 99) is False
+    assert ed.select_edge(0, 4) is False  # nodes exist but no edge
+
+
+def test_clear_selection_clears_both_kinds():
+    ed = GraphEditor(_toy_graph())
+    ed.select(0); ed.select_edge(0, 1)
+    ed.clear_selection()
+    assert ed.selected == set()
+    assert ed.selected_edges == set()
+
+
+# ── Edge delete ───────────────────────────────────────────────────
+
+
+def test_delete_selected_edges_removes_only_edges():
+    ed = GraphEditor(_toy_graph())
+    ed.select_edge(2, 3); ed.select_edge(3, 4)
+    n = ed.delete_selected_edges()
+    assert n == 2
+    assert not ed.graph.has_edge(2, 3)
+    assert not ed.graph.has_edge(3, 4)
+    # Endpoints still in the graph.
+    assert 2 in ed.graph and 3 in ed.graph and 4 in ed.graph
+    # Selection cleared.
+    assert ed.selected_edges == set()
+
+
+def test_delete_selected_node_drops_stale_edge_selection():
+    ed = GraphEditor(_toy_graph())
+    ed.select_edge(0, 1); ed.select_edge(1, 2)
+    ed.select(1)
+    ed.delete_selected()
+    # Edge selections referencing node 1 should be dropped.
+    assert ed.selected_edges == set()
+
+
+def test_delete_selected_edges_then_undo():
+    ed = GraphEditor(_toy_graph())
+    ed.select_edge(2, 3)
+    ed.delete_selected_edges()
+    assert not ed.graph.has_edge(2, 3)
+    ed.undo()
+    assert ed.graph.has_edge(2, 3)
+
+
+# ── Snap-to-centerline ────────────────────────────────────────────
+
+
+def test_add_node_snaps_to_distance_map_peak():
+    # 11x11 distance map with the peak at image-row 3, col 5.
+    # In graph coords: x=5, y = H - 3 = 8.
+    dmap = np.zeros((11, 11), dtype=np.float32)
+    dmap[3, 5] = 10.0
+    ed = GraphEditor(_toy_graph(), distance_map=dmap)
+    # Click 2 pixels off the peak — snap should pull it back.
+    n = ed.add_node(7.0, 8.0, snap_window=3)
+    assert ed.graph.nodes[n]["x"] == pytest.approx(5.0)
+    assert ed.graph.nodes[n]["y"] == pytest.approx(8.0)
+    assert ed.graph.nodes[n]["radius"] == pytest.approx(10.0)
+
+
+def test_add_node_snap_window_zero_disabled():
+    dmap = np.zeros((11, 11), dtype=np.float32)
+    dmap[3, 5] = 10.0
+    ed = GraphEditor(_toy_graph(), distance_map=dmap)
+    n = ed.add_node(7.0, 8.0, snap_window=0)
+    # Stays at click position.
+    assert ed.graph.nodes[n]["x"] == pytest.approx(7.0)
+    assert ed.graph.nodes[n]["y"] == pytest.approx(8.0)
+
+
+def test_add_node_snap_no_distance_map_is_noop():
+    ed = GraphEditor(_toy_graph())
+    n = ed.add_node(7.0, 8.0, snap_window=10)
+    assert ed.graph.nodes[n]["x"] == pytest.approx(7.0)
+    assert ed.graph.nodes[n]["y"] == pytest.approx(8.0)

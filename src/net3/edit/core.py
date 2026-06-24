@@ -75,7 +75,8 @@ class GraphEditor:
         self.graph = graph
         self.mask = mask
         self.distance_map = distance_map
-        self.selected: Set = set()
+        self.selected: Set = set()                  # selected node ids
+        self.selected_edges: Set[Tuple] = set()     # canonical (u, v) tuples
         self._undo_stack: deque = deque(maxlen=self.MAX_UNDO_DEPTH)
         # Stamp an initial snapshot so the very first edit is undoable.
         self._snapshot()
@@ -97,8 +98,13 @@ class GraphEditor:
     # ── Snapshot / undo ────────────────────────────────────────────
 
     def _snapshot(self) -> None:
-        """Save a deep copy of (graph, selection) onto the undo stack."""
-        self._undo_stack.append((deepcopy(self.graph), set(self.selected)))
+        """Save a deep copy of (graph, node selection, edge selection)
+        onto the undo stack."""
+        self._undo_stack.append((
+            deepcopy(self.graph),
+            set(self.selected),
+            set(self.selected_edges),
+        ))
 
     def undo(self) -> bool:
         """Restore the snapshot saved before the most recent mutation.
@@ -112,15 +118,59 @@ class GraphEditor:
         """
         if len(self._undo_stack) <= 1:
             return False
-        g, sel = self._undo_stack.pop()
+        snap = self._undo_stack.pop()
+        # Older snapshots may have only 2 fields (graph, node-sel) before
+        # edge selection was added — tolerate either shape.
+        if len(snap) == 3:
+            g, sel, sel_e = snap
+        else:
+            g, sel = snap
+            sel_e = set()
         self.graph = deepcopy(g)
         self.selected = set(sel)
+        self.selected_edges = set(sel_e)
         return True
 
     # ── Selection ──────────────────────────────────────────────────
 
     def clear_selection(self) -> None:
+        """Clear BOTH node and edge selections."""
         self.selected.clear()
+        self.selected_edges.clear()
+
+    # ── Edge selection ─────────────────────────────────────────────
+
+    def select_edge(self, u, v) -> bool:
+        """Select an edge by endpoints (order-insensitive).  Returns
+        True if the edge exists and was added."""
+        if not self.graph.has_edge(u, v):
+            return False
+        self.selected_edges.add(self._canonical_edge(u, v))
+        return True
+
+    def deselect_edge(self, u, v) -> None:
+        self.selected_edges.discard(self._canonical_edge(u, v))
+
+    def toggle_edge_selection(self, u, v) -> None:
+        key = self._canonical_edge(u, v)
+        if key in self.selected_edges:
+            self.selected_edges.remove(key)
+        elif self.graph.has_edge(u, v):
+            self.selected_edges.add(key)
+
+    def delete_selected_edges(self) -> int:
+        """Remove every selected edge (keeping endpoint nodes).
+        Returns the count of edges deleted.  Clears edge selection."""
+        if not self.selected_edges:
+            return 0
+        self._snapshot()
+        n = 0
+        for u, v in list(self.selected_edges):
+            if self.graph.has_edge(u, v):
+                self.graph.remove_edge(u, v)
+                n += 1
+        self.selected_edges.clear()
+        return n
 
     def select(self, node) -> None:
         if node in self.graph:
@@ -176,6 +226,50 @@ class GraphEditor:
                 best = n
         return best
 
+    def edge_at(
+        self, x: float, y: float, tolerance: float = 8.0,
+    ) -> Optional[Tuple]:
+        """Find the nearest edge within `tolerance` of (x, y).
+        Returns the (u, v) canonical edge tuple, or None.  Distance
+        is point-to-segment.  Vectorised across all edges — fast
+        enough for ~20k edges."""
+        if self.graph.number_of_edges() == 0:
+            return None
+        edges_list: List[Tuple] = []
+        coords = []
+        for u, v in self.graph.edges:
+            nu = self.graph.nodes[u]
+            nv = self.graph.nodes[v]
+            xu = nu.get("x"); yu = nu.get("y")
+            xv = nv.get("x"); yv = nv.get("y")
+            if None in (xu, yu, xv, yv):
+                continue
+            edges_list.append(self._canonical_edge(u, v))
+            coords.append([float(xu), float(yu), float(xv), float(yv)])
+        if not coords:
+            return None
+        c = np.asarray(coords, dtype=np.float64)
+        ax, ay, bx, by = c[:, 0], c[:, 1], c[:, 2], c[:, 3]
+        dx, dy = bx - ax, by - ay
+        seg_len2 = np.maximum(dx * dx + dy * dy, 1e-12)
+        t = np.clip(((x - ax) * dx + (y - ay) * dy) / seg_len2, 0.0, 1.0)
+        px, py = ax + t * dx, ay + t * dy
+        d2 = (px - x) ** 2 + (py - y) ** 2
+        i = int(np.argmin(d2))
+        if d2[i] > tolerance * tolerance:
+            return None
+        return edges_list[i]
+
+    @staticmethod
+    def _canonical_edge(u, v) -> Tuple:
+        """Canonical key for an undirected edge — always (min, max) so
+        (u, v) and (v, u) share the same tuple."""
+        try:
+            return (u, v) if u <= v else (v, u)
+        except TypeError:
+            # Mixed-type node ids — fall back to repr ordering.
+            return (u, v) if repr(u) <= repr(v) else (v, u)
+
     # ── Mutations (each snapshots state before mutating) ───────────
 
     def _next_node_id(self):
@@ -191,16 +285,37 @@ class GraphEditor:
         x: float,
         y: float,
         radius: Optional[float] = None,
+        snap_window: int = 0,
     ):
-        """Add a new node at (x, y) and return its id.  Radius is
-        sampled from the distance map if not given and the map is
-        loaded; otherwise falls back to DEFAULT_RADIUS."""
+        """Add a new node at graph coords (x, y) and return its id.
+
+        Coordinate convention: ``y`` is in net3's math-y convention
+        (``y = image_height - row``).  When sampling the distance map
+        we convert to image row internally.
+
+        Parameters
+        ----------
+        x, y : float
+            Click position in graph coordinates.
+        radius : float, optional
+            Explicit radius.  If None and a distance map is loaded,
+            radius is sampled from the map at (x, y) after the snap.
+            Falls back to DEFAULT_RADIUS otherwise.
+        snap_window : int, default 0
+            If positive AND a distance map is loaded, the node is
+            placed at the local distance-transform peak within a
+            ``(2 * snap_window + 1)`` square centred on the click.
+            This snaps clicks to the vessel centerline so newly
+            created connections look clean.
+        """
         self._snapshot()
         n = self._next_node_id()
+        if (snap_window > 0 and self.distance_map is not None):
+            x, y = self._snap_to_centerline(x, y, snap_window)
         if radius is None and self.distance_map is not None:
-            iy = int(round(y))
-            ix = int(round(x))
             H, W = self.distance_map.shape
+            iy = int(round(H - y))      # math y → image row
+            ix = int(round(x))
             if 0 <= iy < H and 0 <= ix < W:
                 radius = float(self.distance_map[iy, ix])
             else:
@@ -210,9 +325,35 @@ class GraphEditor:
         self.graph.add_node(n, x=float(x), y=float(y), radius=float(radius))
         return n
 
+    def _snap_to_centerline(
+        self, x: float, y: float, window: int,
+    ) -> Tuple[float, float]:
+        """Move (x, y) to the local distance-transform maximum within
+        ``window`` pixels.  Returns the snapped graph coordinates.
+        No-op if no distance map."""
+        if self.distance_map is None:
+            return x, y
+        H, W = self.distance_map.shape
+        iy = int(round(H - y))
+        ix = int(round(x))
+        y0, y1 = max(0, iy - window), min(H, iy + window + 1)
+        x0, x1 = max(0, ix - window), min(W, ix + window + 1)
+        if y1 <= y0 or x1 <= x0:
+            return x, y
+        patch = self.distance_map[y0:y1, x0:x1]
+        if patch.size == 0:
+            return x, y
+        flat = int(np.argmax(patch))
+        dy, dx = np.unravel_index(flat, patch.shape)
+        new_iy = y0 + int(dy)
+        new_ix = x0 + int(dx)
+        # image row → math y
+        return float(new_ix), float(H - new_iy)
+
     def delete_selected(self) -> int:
         """Remove every selected node and its incident edges.  Returns
-        the count of nodes deleted.  Clears the selection."""
+        the count of nodes deleted.  Clears node selection AND drops
+        any selected edges that no longer exist."""
         if not self.selected:
             return 0
         self._snapshot()
@@ -222,6 +363,11 @@ class GraphEditor:
                 self.graph.remove_node(node)
                 n_removed += 1
         self.selected.clear()
+        # Drop edges whose endpoints were just removed.
+        self.selected_edges = {
+            (u, v) for (u, v) in self.selected_edges
+            if self.graph.has_edge(u, v)
+        }
         return n_removed
 
     def add_edge(self, u, v) -> bool:

@@ -19,7 +19,7 @@ throughout.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -34,8 +34,19 @@ NODE_COLOR_SELECTED = "yellow"
 NODE_COLOR_JUNCTION = "cyan"
 NODE_COLOR_TIP = "lime"
 EDGE_COLOR = "orange"
+EDGE_COLOR_SELECTED = "yellow"
 EDGE_WIDTH = 1.2
+EDGE_WIDTH_SELECTED = 2.4
+RUBBER_BAND_COLOR = "yellow"
+RUBBER_BAND_WIDTH = 0.8
+# Default hit-test tolerance (pixels in graph coords) when zoom info
+# isn't available.  Scales inversely with zoom in `_click_tolerance`.
 NEW_NODE_TOLERANCE_FALLBACK = 8.0
+# Snap-to-centerline search radius (graph pixels).  0 disables.
+SNAP_WINDOW_DEFAULT = 6
+# Pixels-of-canvas-movement above which a press/release is treated
+# as a drag instead of a click.
+DRAG_THRESHOLD_PX = 4.0
 
 
 # ── Public entry point ────────────────────────────────────────────
@@ -122,6 +133,7 @@ class _EditorApp:
         self.viewer = napari.Viewer(title=f"net3 edit · {default_save_path.name}")
         self._nodes_layer = None
         self._edges_layer = None
+        self._rubber_band_layer = None
         # Stable ordering for the points layer — backend node ids in
         # whatever order we built the points array.  Used to map napari
         # selection indices back to graph node ids.
@@ -197,7 +209,11 @@ class _EditorApp:
 
     def _refresh_edges_layer(self) -> None:
         segments = []
+        edge_colors = []
+        edge_widths = []
         G = self.editor.graph
+        sel_edges = self.editor.selected_edges
+        canon = GraphEditor._canonical_edge
         for u, v in G.edges:
             xu = float(G.nodes[u].get("x", 0.0))
             yu = float(G.nodes[u].get("y", 0.0))
@@ -207,6 +223,12 @@ class _EditorApp:
                 [self._image_h - yu, xu],
                 [self._image_h - yv, xv],
             ])
+            if canon(u, v) in sel_edges:
+                edge_colors.append(EDGE_COLOR_SELECTED)
+                edge_widths.append(EDGE_WIDTH_SELECTED)
+            else:
+                edge_colors.append(EDGE_COLOR)
+                edge_widths.append(EDGE_WIDTH)
         if self._edges_layer is not None:
             try:
                 self.viewer.layers.remove(self._edges_layer)
@@ -218,8 +240,8 @@ class _EditorApp:
         self._edges_layer = self.viewer.add_shapes(
             segments,
             shape_type="line",
-            edge_color=EDGE_COLOR,
-            edge_width=EDGE_WIDTH,
+            edge_color=edge_colors,
+            edge_width=edge_widths,
             face_color="transparent",
             opacity=0.85,
             name="edges",
@@ -253,7 +275,8 @@ class _EditorApp:
             return b
 
         _btn("Delete selected  (d)",
-              "Remove every selected node and its edges.",
+              "Remove every selected node (and its incident edges) "
+              "AND every selected edge (keeping endpoints).",
               self._action_delete)
         _btn("Connect 2 selected  (e)",
               "Add an edge between the exactly-two selected nodes.",
@@ -314,38 +337,15 @@ class _EditorApp:
         def _(viewer):
             self._action_save()
 
-        # Click handling: left-click toggles nearest-node selection;
-        # shift+left-click on empty canvas creates a new node.
+        # Mouse model:
+        #   plain click       : toggle nearest node, fall back to nearest edge
+        #   Shift + click     : create new node at click (snap-to-centerline)
+        #   Control + drag    : rectangle select  (replaces current selection)
+        #   Control + Shift + drag : rectangle select, additive
+        #   plain drag        : pan (napari default — we don't intercept)
         @v.mouse_drag_callbacks.append
-        def _on_click(viewer, event):
-            if event.button != 1:  # only left-click
-                return
-            pos = event.position
-            if pos is None or len(pos) < 2:
-                return
-            row, col = float(pos[-2]), float(pos[-1])
-            graph_x = col
-            graph_y = self._image_h - row
-            tol = self._click_tolerance()
-            hit = self.editor.node_at(graph_x, graph_y, tolerance=tol)
-            shift = "Shift" in event.modifiers
-            if hit is None:
-                if shift:
-                    self.editor.add_node(graph_x, graph_y)
-                    self._announce(f"created node at ({graph_x:.1f}, "
-                                    f"{graph_y:.1f})")
-                    self._refresh_all()
-                else:
-                    self._announce("(click missed — try closer to a node, "
-                                    "or Shift-click to create one)")
-                    self._refresh_status()
-            else:
-                self.editor.toggle_selection(hit)
-                action = ("selected" if hit in self.editor.selected
-                          else "deselected")
-                self._announce(f"node {hit} {action}")
-                self._refresh_nodes_layer()
-                self._refresh_status()
+        def _on_press(viewer, event):
+            yield from self._mouse_handler(event)
 
     def _click_tolerance(self) -> float:
         """Click tolerance scaled to the current camera zoom so the
@@ -358,14 +358,161 @@ class _EditorApp:
             pass
         return NEW_NODE_TOLERANCE_FALLBACK
 
+    # ── Mouse press/drag generator ──────────────────────────────
+
+    def _event_graph_xy(self, event) -> Optional[tuple]:
+        """Pull (graph_x, graph_y) out of a napari mouse event in
+        canvas coords.  Returns None if the event has no position."""
+        pos = event.position
+        if pos is None or len(pos) < 2:
+            return None
+        row, col = float(pos[-2]), float(pos[-1])
+        return col, self._image_h - row
+
+    def _mouse_handler(self, event):
+        """Generator that distinguishes click vs drag and dispatches
+        to the right action.  Yields once after the press; loops over
+        mouse_move events; on release decides click vs drag.
+        Suppresses napari's pan when Ctrl is held (drag-select)."""
+        if event.button != 1:  # only left button
+            return
+        start = self._event_graph_xy(event)
+        if start is None:
+            return
+        ctrl = "Control" in event.modifiers
+        shift = "Shift" in event.modifiers
+        # If Ctrl is held, this is a drag-select gesture — show a live
+        # rubber-band rectangle until release.
+        last = start
+        moved = False
+        # Yield to let napari deliver mouse_move events.  The generator
+        # resumes for each one until release.
+        yield
+        while event.type == "mouse_move":
+            now = self._event_graph_xy(event)
+            if now is None:
+                yield
+                continue
+            dx = now[0] - start[0]
+            dy = now[1] - start[1]
+            if (dx * dx + dy * dy) > (DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX):
+                moved = True
+            last = now
+            if ctrl and moved:
+                self._show_rubber_band(start, now)
+            yield
+        # mouse_release
+        end = last
+        self._hide_rubber_band()
+        if not moved:
+            # Treat as click.
+            self._handle_click(end[0], end[1], shift=shift)
+        elif ctrl:
+            # Drag-select rectangle.
+            self.editor.select_in_rect(
+                start[0], start[1], end[0], end[1], additive=shift,
+            )
+            n = sum(1 for _ in self.editor.selected)
+            self._announce(f"rectangle-selected: {n} node(s)")
+            self._refresh_nodes_layer()
+            self._refresh_status()
+        # else: plain drag without Ctrl → napari already panned; nothing
+        # for us to do.
+
+    def _handle_click(self, gx: float, gy: float, shift: bool) -> None:
+        tol = self._click_tolerance()
+        # Shift+click on canvas → create a new node, snapped to the
+        # local centerline if a distance map is loaded.
+        if shift:
+            n = self.editor.add_node(gx, gy, snap_window=SNAP_WINDOW_DEFAULT)
+            r = self.editor.graph.nodes[n].get("radius", 0.0)
+            self._announce(
+                f"created node {n} at ({gx:.1f}, {gy:.1f})  r={r:.1f}")
+            self._refresh_all()
+            return
+        # Plain click → try node first (more specific), fall back to edge.
+        node_hit = self.editor.node_at(gx, gy, tolerance=tol)
+        if node_hit is not None:
+            self.editor.toggle_selection(node_hit)
+            in_ = node_hit in self.editor.selected
+            self._announce(
+                f"node {node_hit} {'selected' if in_ else 'deselected'}")
+            self._refresh_nodes_layer()
+            self._refresh_status()
+            return
+        edge_hit = self.editor.edge_at(gx, gy, tolerance=tol)
+        if edge_hit is not None:
+            u, v = edge_hit
+            self.editor.toggle_edge_selection(u, v)
+            sel = (u, v) in self.editor.selected_edges
+            self._announce(
+                f"edge ({u},{v}) {'selected' if sel else 'deselected'}")
+            self._refresh_edges_layer()
+            self._refresh_status()
+            return
+        self._announce(
+            "(click missed — Shift-click to create a node)")
+        self._refresh_status()
+
+    # ── Rubber-band rectangle (live during Ctrl+drag) ──────────
+
+    def _show_rubber_band(self, start, end) -> None:
+        """Update / create a transient Shapes layer with a single
+        rectangle covering the drag region.  Uses napari (row, col)
+        coords; we convert from graph (x, y) here."""
+        r0 = self._image_h - start[1]
+        r1 = self._image_h - end[1]
+        c0, c1 = start[0], end[0]
+        rect = np.array([
+            [min(r0, r1), min(c0, c1)],
+            [min(r0, r1), max(c0, c1)],
+            [max(r0, r1), max(c0, c1)],
+            [max(r0, r1), min(c0, c1)],
+        ])
+        if self._rubber_band_layer is None:
+            self._rubber_band_layer = self.viewer.add_shapes(
+                [rect],
+                shape_type="rectangle",
+                edge_color=RUBBER_BAND_COLOR,
+                edge_width=RUBBER_BAND_WIDTH,
+                face_color="transparent",
+                opacity=0.7,
+                name="rubber band",
+            )
+        else:
+            try:
+                self._rubber_band_layer.data = [rect]
+            except Exception:
+                # Fallback: rebuild.
+                self._hide_rubber_band()
+                self._show_rubber_band(start, end)
+
+    def _hide_rubber_band(self) -> None:
+        if self._rubber_band_layer is not None:
+            try:
+                self.viewer.layers.remove(self._rubber_band_layer)
+            except (KeyError, ValueError):
+                pass
+            self._rubber_band_layer = None
+
     # ── Actions ─────────────────────────────────────────────────
 
     def _announce(self, msg: str) -> None:
         self._last_action = msg
 
     def _action_delete(self) -> None:
-        n = self.editor.delete_selected()
-        self._announce(f"deleted {n} node(s)")
+        # Delete BOTH selected nodes (with their incident edges) and
+        # selected edges (keeping endpoint nodes).  Whichever the user
+        # has staged, `d` removes it.
+        n_nodes = self.editor.delete_selected()
+        n_edges = self.editor.delete_selected_edges()
+        parts = []
+        if n_nodes:
+            parts.append(f"{n_nodes} node(s)")
+        if n_edges:
+            parts.append(f"{n_edges} edge(s) only")
+        msg = ("deleted " + " + ".join(parts)) if parts else "nothing selected"
+        self._announce(msg)
         self._refresh_all()
 
     def _action_connect(self) -> None:
@@ -421,10 +568,16 @@ class _EditorApp:
         text = (
             f"<b>graph:</b> {self.editor.n_nodes} nodes, "
             f"{self.editor.n_edges} edges<br>"
-            f"<b>selected:</b> {len(self.editor.selected)}<br>"
+            f"<b>selected:</b> {len(self.editor.selected)} nodes, "
+            f"{len(self.editor.selected_edges)} edges<br>"
             f"<b>undo depth:</b> {len(self.editor._undo_stack)}<br>"
             f"<br><b>last:</b> {last}<br>"
-            f"<br><b>save target:</b><br>{self.default_save_path}"
+            f"<br><b>save target:</b><br>{self.default_save_path}<br>"
+            f"<br><b>mouse:</b><br>"
+            f"&nbsp;&nbsp;click = toggle nearest node/edge<br>"
+            f"&nbsp;&nbsp;Shift+click = create node (snapped)<br>"
+            f"&nbsp;&nbsp;Ctrl+drag = rectangle select<br>"
+            f"&nbsp;&nbsp;Ctrl+Shift+drag = additive"
         )
         if self._status_lbl is not None:
             self._status_lbl.setText(text)

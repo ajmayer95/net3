@@ -210,10 +210,12 @@ it'll print a hint with the right command to re-vectorise.
 
 | Action | Key | Mouse |
 |---|---|---|
-| Select / deselect node | — | Click near a node |
-| Create node | — | Shift + click on empty canvas |
-| Delete selected | `d` | — |
-| Connect two selected | `e` | — |
+| Toggle nearest node OR edge | — | Click (node wins over edge if both in range) |
+| Create node (snap-to-centerline) | — | Shift + click on empty canvas |
+| Rectangle select (replace) | — | Ctrl + drag |
+| Rectangle select (additive) | — | Ctrl + Shift + drag |
+| Delete selected nodes AND edges | `d` | — |
+| Connect two selected nodes | `e` | — |
 | Highlight cycles | `m` | — |
 | Streamline (collapse degree-2) | `n` | — |
 | Clear selection | `c` | — |
@@ -222,6 +224,18 @@ it'll print a hint with the right command to re-vectorise.
 
 Node colors: **green** = degree-1 tip, **cyan** = degree-≥3 junction,
 **red** = intermediate, **yellow** = selected.
+Edge colors: **orange** = normal, **yellow** (thicker) = selected.
+
+**Snap-to-centerline**: when a distance map is loaded
+(`--distance-map dm.png`), new nodes from Shift+click are snapped to
+the local distance-transform peak within a ±6 px window. Drop a node
+slightly off-centerline and it'll pull onto the vessel midline.
+
+**Edge editing**: clicking an edge that has no node within click
+range toggles its selection. Press `d` to delete just the edge
+(keeping endpoints). This is the right operation for "false junction
+between two crossing vessels" — delete the false edge, the two real
+vessels keep their structure.
 
 ### Backend API (no GUI)
 
