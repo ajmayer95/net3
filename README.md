@@ -59,23 +59,6 @@ install. Read it when you hit a specific question, not start-to-finish.
 If you need both — edit the centerline form, then press `n`
 (streamline) in the editor before saving to collapse to topological.
 
-## Developer install
-
-If you want to modify net3's source:
-
-```bash
-git clone https://github.com/ajmayer95/net3.git
-cd net3
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -e '.[gui,dev]'
-pytest -q
-```
-
-Edits to `src/net3/` take effect immediately. `pytest -q` reports 32
-passed.
-
 ## Use from Python
 
 Inside a Python script, notebook, or `python3` REPL — NOT pasted into a
@@ -266,6 +249,11 @@ for the full surface.
 - Radii are distance-transform values at triangle centers. Good first-pass estimate; sub-pixel-accurate diameter requires per-edge refitting downstream.
 - `min_feature_size` is in pixels and is the most magnification-sensitive parameter — always reset it for new data.
 - The loader auto-thresholds at 127 if the image isn't already 0/1.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the editable-install dev
+setup, repo layout, and how to file an issue or PR.
 
 ## License
 
