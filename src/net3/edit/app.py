@@ -602,7 +602,13 @@ class _EditorApp:
             r = self.editor.graph.nodes[n].get("radius", 0.0)
             self._announce(
                 f"created node {n} at ({gx:.1f}, {gy:.1f})  r={r:.1f}")
-            self._refresh_all()
+            # Add-node only mutates nodes -- no edges change -- so skip
+            # the (very expensive) edges-layer rebuild that _refresh_all
+            # would otherwise trigger.  At 39k edges this was the
+            # ~5 s per-edit bottleneck on the 15-somite mosaic.
+            self._refresh_nodes_layer()
+            self._refresh_selection_overlays()
+            self._refresh_status()
             return
         # Plain click → try node first (more specific), fall back to edge.
         node_hit = self.editor.node_at(gx, gy, tolerance=tol)
@@ -808,13 +814,52 @@ class _EditorApp:
         self._refresh_all()
 
     def _action_connect(self) -> None:
+        # Snapshot the edge set so we can append only the new edge(s)
+        # rather than rebuild the whole Shapes layer.
+        before = set(GraphEditor._canonical_edge(u, v)
+                     for u, v in self.editor.graph.edges)
         ok = self.editor.connect_selected_pair()
         if ok:
             self._announce("added edge between the 2 selected nodes")
         else:
             self._announce("connect needs exactly 2 selected nodes "
                             "(and edge must not already exist)")
-        self._refresh_all()
+            self._refresh_status()
+            return
+        after = set(GraphEditor._canonical_edge(u, v)
+                    for u, v in self.editor.graph.edges)
+        new_edges = list(after - before)
+        if (self._edges_layer is None or not new_edges
+                or len(new_edges) > 32):
+            # Fall back to full rebuild if the layer isn't around yet
+            # or many edges changed at once.
+            self._refresh_all()
+            return
+        # Incremental append — O(|new edges|) instead of O(|all edges|).
+        try:
+            G = self.editor.graph
+            segs = []
+            for u, v in new_edges:
+                xu = float(G.nodes[u].get("x", 0.0))
+                yu = float(G.nodes[u].get("y", 0.0))
+                xv = float(G.nodes[v].get("x", 0.0))
+                yv = float(G.nodes[v].get("y", 0.0))
+                segs.append([
+                    [self._image_h - yu, xu],
+                    [self._image_h - yv, xv],
+                ])
+            self._edges_layer.add_lines(segs, edge_color=EDGE_COLOR,
+                                        edge_width=EDGE_WIDTH)
+            # Maintain index bookkeeping the rest of the editor relies on.
+            for pair in new_edges:
+                self._edge_pair_to_index[pair] = len(self._edge_index_order)
+                self._edge_index_order.append(pair)
+            self._refresh_nodes_layer()
+            self._refresh_selection_overlays()
+            self._refresh_status()
+        except Exception:
+            # Anything goes wrong → fall back to a full rebuild.
+            self._refresh_all()
 
     def _action_cycles(self) -> None:
         n = self.editor.select_cycles()
