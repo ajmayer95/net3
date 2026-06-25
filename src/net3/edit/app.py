@@ -598,6 +598,7 @@ class _EditorApp:
         tol = self._click_tolerance()
         # Add-Node mode (or Shift+click in any mode) creates a new node.
         if self._mode == "add" or shift:
+            sticky = shift  # Shift+click is one-shot; Add Mode-1-shot too
             n = self.editor.add_node(gx, gy, snap_window=SNAP_WINDOW_DEFAULT)
             r = self.editor.graph.nodes[n].get("radius", 0.0)
             self._announce(
@@ -608,7 +609,13 @@ class _EditorApp:
             # ~5 s per-edit bottleneck on the 15-somite mosaic.
             self._refresh_nodes_layer()
             self._refresh_selection_overlays()
-            self._refresh_status()
+            # Auto-revert to Select after one add so the next click
+            # doesn't accidentally drop another node.  Press `3` (or
+            # the Add Node button) to add again.
+            if not sticky:
+                self._set_mode("select")
+            else:
+                self._refresh_status()
             return
         # Plain click → try node first (more specific), fall back to edge.
         node_hit = self.editor.node_at(gx, gy, tolerance=tol)
@@ -881,9 +888,60 @@ class _EditorApp:
         self._refresh_status()
 
     def _action_undo(self) -> None:
+        canon = GraphEditor._canonical_edge
+        edges_before = set(canon(u, v)
+                           for u, v in self.editor.graph.edges)
         ok = self.editor.undo()
         self._announce("undo applied" if ok else "(nothing to undo)")
-        self._refresh_all()
+        if not ok:
+            self._refresh_status()
+            return
+        edges_after = set(canon(u, v) for u, v in self.editor.graph.edges)
+        added = list(edges_after - edges_before)
+        removed = list(edges_before - edges_after)
+        # Fall back to full rebuild when many edges changed (streamline,
+        # bulk delete, etc) or when the layer doesn't exist yet.
+        if (self._edges_layer is None
+                or len(added) + len(removed) > 32):
+            self._refresh_all()
+            return
+        try:
+            if removed:
+                removed_set = set(removed)
+                idxs = [self._edge_pair_to_index[p]
+                        for p in removed if p in self._edge_pair_to_index]
+                if idxs:
+                    self._edges_layer.selected_data = set(idxs)
+                    self._edges_layer.remove_selected()
+                self._edge_index_order = [
+                    p for p in self._edge_index_order
+                    if p not in removed_set
+                ]
+                self._edge_pair_to_index = {
+                    p: i for i, p in enumerate(self._edge_index_order)
+                }
+            if added:
+                G = self.editor.graph
+                segs = []
+                for u, v in added:
+                    xu = float(G.nodes[u].get("x", 0.0))
+                    yu = float(G.nodes[u].get("y", 0.0))
+                    xv = float(G.nodes[v].get("x", 0.0))
+                    yv = float(G.nodes[v].get("y", 0.0))
+                    segs.append([
+                        [self._image_h - yu, xu],
+                        [self._image_h - yv, xv],
+                    ])
+                self._edges_layer.add_lines(segs, edge_color=EDGE_COLOR,
+                                             edge_width=EDGE_WIDTH)
+                for pair in added:
+                    self._edge_pair_to_index[pair] = len(self._edge_index_order)
+                    self._edge_index_order.append(pair)
+            self._refresh_nodes_layer()
+            self._refresh_selection_overlays()
+            self._refresh_status()
+        except Exception:
+            self._refresh_all()
 
     def _action_save(self) -> None:
         self.editor.save(self.default_save_path)
