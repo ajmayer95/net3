@@ -169,6 +169,10 @@ class _EditorApp:
         self._rect_tool_handler_blocked = False
         # Mode state
         self._mode: str = "select"   # "select" | "rect" | "add"
+        # Show degree-2 intermediate path nodes?  Off by default — at
+        # 30k+ nodes, drawing every intermediate slows every edit by
+        # an order of magnitude.  Toggle with `i` or the dock checkbox.
+        self._show_intermediates: bool = False
         # Stable ordering for the points layer — backend node ids in
         # whatever order we built the points array.  Used to map napari
         # selection indices back to graph node ids.
@@ -206,21 +210,31 @@ class _EditorApp:
     def _node_positions_and_colors(self):
         """Base nodes layer — coloured only by degree, NOT by
         selection.  Selection visuals live in a small overlay layer
-        rebuilt independently so selection toggles stay O(1)."""
+        rebuilt independently so selection toggles stay O(1).
+
+        When `_show_intermediates` is False (default), degree-2 nodes
+        are skipped from the drawn layer — they still live in the
+        graph and `_node_xy_by_id` so selection overlays / hit-test
+        remain correct, but tens of thousands of intermediate markers
+        don't get re-uploaded to the GPU on every edit.
+        """
         positions = []
         face_colors = []
         sizes = []
         ids: List = []
         xy_by_id: dict = {}
         G = self.editor.graph
+        show_intermediates = getattr(self, "_show_intermediates", False)
         for n, d in G.nodes(data=True):
             x = d.get("x"); y = d.get("y")
             if x is None or y is None:
                 continue
-            positions.append([self._image_h - float(y), float(x)])
-            ids.append(n)
             xy_by_id[n] = (float(x), float(y))
             deg = G.degree(n)
+            if deg == 2 and not show_intermediates:
+                continue
+            positions.append([self._image_h - float(y), float(x)])
+            ids.append(n)
             if deg >= 3:
                 face_colors.append(NODE_COLOR_JUNCTION)
             elif deg == 1:
@@ -431,6 +445,25 @@ class _EditorApp:
         _btn("Save  (s)",
               f"Save graph to {self.default_save_path}.",
               self._action_save)
+
+        # View toggles
+        view_label = QLabel("<b>View</b>")
+        view_label.setStyleSheet("padding: 6px 6px 2px 6px;")
+        layout.addWidget(view_label)
+
+        self._intermediates_btn = QPushButton("Show intermediates  (i)")
+        self._intermediates_btn.setCheckable(True)
+        self._intermediates_btn.setChecked(self._show_intermediates)
+        self._intermediates_btn.setToolTip(
+            "Toggle visibility of degree-2 path nodes.  Off by "
+            "default for graphs with many intermediates so editing "
+            "stays responsive; selection / hit-testing still works "
+            "for hidden nodes."
+        )
+        self._intermediates_btn.clicked.connect(
+            self._toggle_intermediates)
+        layout.addWidget(self._intermediates_btn)
+
         layout.addStretch(1)
 
         widget = QWidget()
@@ -471,6 +504,10 @@ class _EditorApp:
         @v.bind_key("s", overwrite=True)
         def _(viewer):
             self._action_save()
+
+        @v.bind_key("i", overwrite=True)
+        def _(viewer):
+            self._toggle_intermediates()
 
         # Mode shortcuts: 1 / 2 / 3 to switch.
         @v.bind_key("1", overwrite=True)
@@ -814,6 +851,17 @@ class _EditorApp:
             )
         except Exception:
             pass
+        self._refresh_status()
+
+    def _toggle_intermediates(self) -> None:
+        self._show_intermediates = not self._show_intermediates
+        if getattr(self, "_intermediates_btn", None) is not None:
+            self._intermediates_btn.setChecked(self._show_intermediates)
+        self._announce(
+            f"intermediates {'shown' if self._show_intermediates else 'hidden'}"
+        )
+        self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
         self._refresh_status()
 
     # ── Status panel ────────────────────────────────────────────
