@@ -181,7 +181,8 @@ def get_interior_point(contour: List[List[float]]) -> Tuple[float, float]:
     return (x, y)
 
 
-def add_noise_to_contours(contours: List, noise_scale: float = 0.1) -> List:
+def add_noise_to_contours(contours: List, noise_scale: float = 0.1,
+                          seed: int = 0) -> List:
     """
     Add small noise to contour points for triangulation stability.
 
@@ -191,16 +192,22 @@ def add_noise_to_contours(contours: List, noise_scale: float = 0.1) -> List:
         List of contours
     noise_scale : float
         Scale of random noise to add
+    seed : int
+        RNG seed.  Fixed by default so vectorization is deterministic —
+        Delaunay triangulation near degenerate configurations is very
+        sensitive to per-point noise, so an unseeded call gives a
+        different graph every run.  Pass different seeds to sweep.
 
     Returns
     -------
     List
         Contours with noise added
     """
+    rng = np.random.default_rng(seed)
     for c in contours:
         for p in c:
-            p[0] = p[0] + noise_scale * np.random.rand()
-            p[1] = p[1] + noise_scale * np.random.rand()
+            p[0] = p[0] + noise_scale * rng.random()
+            p[1] = p[1] + noise_scale * rng.random()
     return contours
 
 
