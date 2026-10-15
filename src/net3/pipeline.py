@@ -45,6 +45,7 @@ def vectorize(
     remove_redundant: str = "all",
     prune_dangling: bool = False,
     prune_dangling_min_length: float = 0.0,
+    merge_junctions_d_max: float = 0.0,
     verbose: bool = True,
     return_triangles: bool = False
 ):
@@ -109,7 +110,7 @@ def vectorize(
     # Step 3: Build mesh
     if verbose:
         print("  [3/7] Building mesh...")
-    mesh_points, mesh_facets, hole_points = build_mesh(contours, longest_idx)
+    mesh_points, mesh_facets, hole_points = build_mesh(contours, longest_idx, image=image)
     if verbose:
         print(f"        {len(mesh_points)} points, {len(hole_points)} holes")
 
@@ -150,6 +151,19 @@ def vectorize(
         if verbose:
             print(f"        Removing redundant nodes (mode={remove_redundant})...")
         G = remove_redundant_nodes(G, mode=remove_redundant, verbose=False)
+
+    # Merge nearby degree-3+ junctions (union-find within d_max px).
+    # Fixes the vectorize artifact where a fat vessel blob produces N
+    # triangles sharing a triple-point, each with its own degree-3 node
+    # at (nearly) the same pixel.  Off by default (d_max=0).
+    if merge_junctions_d_max > 0:
+        from .edit.core import GraphEditor
+        ed = GraphEditor(G)
+        n_merged = ed.merge_close_junctions(d_max=merge_junctions_d_max)
+        G = ed.graph
+        if verbose:
+            print(f"        Merged {n_merged} close junction(s) "
+                   f"(d_max={merge_junctions_d_max:.1f} px)")
 
     # Prune dangling branches (degree-1 endpoints)
     if prune_dangling:

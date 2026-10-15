@@ -350,3 +350,21 @@ def test_add_node_snap_no_distance_map_is_noop():
     n = ed.add_node(7.0, 8.0, snap_window=10)
     assert ed.graph.nodes[n]["x"] == pytest.approx(7.0)
     assert ed.graph.nodes[n]["y"] == pytest.approx(8.0)
+
+
+# ── move_node ─────────────────────────────────────────────────────
+
+
+def test_move_node_preserves_path_direction():
+    """Straightened paths keep the old direction: OF signs flow along path
+    order, so a flipped path flips measured flux (the 2026-09 V-stub bug)."""
+    G = _toy_graph()
+    G.edges[1, 2]['path'] = np.array([[1.0, 0.0], [1.5, 0.2], [2.0, 0.0]])   # runs 1 → 2
+    G.edges[2, 3]['path'] = np.array([[2.0, 0.0], [2.5, 0.1], [3.0, 0.0]])   # runs 2 → 3 (moved node first)
+    ed = GraphEditor(G)
+    assert ed.move_node(2, 2.0, 0.5)
+    p12 = ed.graph.edges[1, 2]['path']
+    p23 = ed.graph.edges[2, 3]['path']
+    np.testing.assert_allclose(p12, [[1.0, 0.0], [2.0, 0.5]])   # still 1 → 2
+    np.testing.assert_allclose(p23, [[2.0, 0.5], [3.0, 0.0]])   # still 2 → 3
+    assert len(ed.graph.edges[2, 4]['path']) == 2                 # no old path: default nbr → node

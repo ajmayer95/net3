@@ -31,7 +31,8 @@ except ImportError:
 
 def build_mesh(
     contours: List,
-    longest_index: int
+    longest_index: int,
+    image: Any = None,
 ) -> Tuple[List, List, List]:
     """
     Build mesh points and facets from contours for triangulation.
@@ -42,6 +43,13 @@ def build_mesh(
         List of contours (each is list of [x,y] points)
     longest_index : int
         Index of the longest (outer) contour
+    image : np.ndarray, optional
+        The binary mask the contours came from.  When given, each hole's
+        seed point is placed on a background pixel inside it (the one
+        farthest from foreground).  Without it the seed is the contour
+        centroid, which for a concave hole containing a vessel island can
+        land on the island — the hole is then not carved out and gets
+        meshed as if it were vessel (a fan of long spurious edges).
 
     Returns
     -------
@@ -53,6 +61,7 @@ def build_mesh(
     # Start with longest contour
     mesh_points = list(contours[longest_index])
     mesh_facets = round_trip_connect(0, len(mesh_points) - 1)
+    outer_sign = np.sign(_signed_area(contours[longest_index]))
 
     # Add other contours as holes
     hole_points = []
@@ -61,12 +70,45 @@ def build_mesh(
             continue
 
         curr_length = len(mesh_points)
-        interior = get_interior_point(contour)
+        interior = None
+        if image is not None and np.sign(_signed_area(contour)) != outer_sign:
+            # opposite orientation to the outer boundary → a hole in the mask
+            interior = _background_seed(contour, image)
+        if interior is None:
+            interior = get_interior_point(contour)
         hole_points.append(interior)
         mesh_points.extend(contour)
         mesh_facets.extend(round_trip_connect(curr_length, len(mesh_points) - 1))
 
     return mesh_points, mesh_facets, hole_points
+
+
+def _signed_area(contour) -> float:
+    c = np.asarray(contour, dtype=float)
+    x, y = c[:, 0], c[:, 1]
+    return 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def _background_seed(contour, image):
+    """Background pixel inside `contour` farthest from any foreground or the
+    contour itself, as (x, y); None if the contour encloses no background."""
+    import cv2
+    c = np.asarray(contour, dtype=float)
+    x0, y0 = np.floor(c.min(axis=0)).astype(int)
+    x1, y1 = np.ceil(c.max(axis=0)).astype(int) + 1
+    h, w = image.shape[:2]
+    x0, y0 = max(x0, 0), max(y0, 0)
+    x1, y1 = min(x1, w), min(y1, h)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    inside = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillPoly(inside, [np.round(c - (x0, y0)).astype(np.int32)], 1)
+    region = (inside > 0) & (image[y0:y1, x0:x1] == 0)
+    if not region.any():
+        return None
+    dist = cv2.distanceTransform(region.astype(np.uint8), cv2.DIST_L2, 3)
+    r, col = np.unravel_index(int(np.argmax(dist)), dist.shape)
+    return (float(col + x0), float(r + y0))
 
 
 def triangulate_mesh(

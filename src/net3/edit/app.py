@@ -33,6 +33,8 @@ NODE_COLOR_UNSELECTED = "red"
 NODE_COLOR_SELECTED = "yellow"
 NODE_COLOR_JUNCTION = "cyan"
 NODE_COLOR_TIP = "lime"
+NODE_COLOR_TRUE_TIP = "magenta"
+NODE_SIZE_TRUE_TIP = 12
 EDGE_COLOR = "orange"
 EDGE_COLOR_SELECTED = "yellow"
 EDGE_WIDTH = 1.2
@@ -57,6 +59,9 @@ def run_editor(
     mask_path: str | Path | None = None,
     distance_map_path: str | Path | None = None,
     save_path: str | Path | None = None,
+    tile_positions_path: str | Path | None = None,
+    video_dirs: list | None = None,
+    video_pattern: str | None = None,
 ) -> GraphEditor:
     """Open the editor on the given graph + optional mask / distance
     map.  Blocks until the napari window is closed.  Returns the
@@ -71,6 +76,11 @@ def run_editor(
     `cv2.distanceTransform` so newly-created nodes get a sensible
     radius from the local distance-transform peak instead of the
     default fallback.
+
+    Optional video overlays: pass ``tile_positions_path`` +
+    ``video_dirs`` + ``video_pattern`` to enable a "load tile video"
+    dropdown in the dock.  Videos are loaded one at a time on demand
+    (memory-conservative).  See :mod:`net3.edit.video_overlay`.
     """
     editor = GraphEditor.from_gpickle(
         graph_path,
@@ -83,7 +93,10 @@ def run_editor(
               f"(max radius {float(editor.distance_map.max()):.1f} px)")
     _maybe_warn_sparse(editor)
     app = _EditorApp(editor,
-                      default_save_path=Path(save_path or graph_path))
+                      default_save_path=Path(save_path or graph_path),
+                      tile_positions_path=tile_positions_path,
+                      video_dirs=video_dirs,
+                      video_pattern=video_pattern)
     app.run()
 
 
@@ -139,6 +152,9 @@ class _EditorApp:
         self,
         editor: GraphEditor,
         default_save_path: Path,
+        tile_positions_path: str | Path | None = None,
+        video_dirs: list | None = None,
+        video_pattern: str | None = None,
     ):
         import napari
         from qtpy.QtWidgets import (
@@ -148,6 +164,18 @@ class _EditorApp:
         self._QMessageBox = QMessageBox
         self.editor = editor
         self.default_save_path = default_save_path
+        # Optional video overlay — feature-flagged, initialized
+        # lazily in _build_dock so failure to load doesn't kill the app.
+        self._video_overlay = None
+        self._video_config = None
+        if (tile_positions_path is not None
+                and video_dirs is not None
+                and video_pattern is not None):
+            self._video_config = dict(
+                tile_positions_path=tile_positions_path,
+                video_dirs=video_dirs,
+                video_pattern=video_pattern,
+            )
         self._image_h = (editor.mask.shape[0]
                           if editor.mask is not None
                           else self._infer_height_from_graph())
@@ -168,7 +196,8 @@ class _EditorApp:
         self._rect_tool_layer = None
         self._rect_tool_handler_blocked = False
         # Mode state
-        self._mode: str = "select"   # "select" | "rect" | "add"
+        self._mode: str = "select"   # "select" | "rect" | "add" | "move"
+        self._move_target = None     # node currently armed for Move
         # Show degree-2 intermediate path nodes?  Off by default — at
         # 30k+ nodes, drawing every intermediate slows every edit by
         # an order of magnitude.  Toggle with `i` or the dock checkbox.
@@ -235,76 +264,107 @@ class _EditorApp:
                 continue
             positions.append([self._image_h - float(y), float(x)])
             ids.append(n)
-            if deg >= 3:
+            is_true_tip = bool(d.get("true_tip"))
+            if is_true_tip:
+                face_colors.append(NODE_COLOR_TRUE_TIP)
+                sizes.append(NODE_SIZE_TRUE_TIP)
+            elif deg >= 3:
                 face_colors.append(NODE_COLOR_JUNCTION)
+                sizes.append(NODE_SIZE_DEFAULT)
             elif deg == 1:
                 face_colors.append(NODE_COLOR_TIP)
+                sizes.append(NODE_SIZE_DEFAULT)
             else:
                 face_colors.append(NODE_COLOR_UNSELECTED)
-            sizes.append(NODE_SIZE_DEFAULT)
+                sizes.append(NODE_SIZE_DEFAULT)
         self._node_index_order = ids
         self._node_xy_by_id = xy_by_id
         return (np.array(positions) if positions
                 else np.zeros((0, 2))), face_colors, sizes
 
     def _refresh_nodes_layer(self) -> None:
+        """Update the nodes Points layer in place (created once).  Never
+        remove/re-add it: that changes layer order, which is what hid the
+        graph under a loaded tile video."""
         positions, colors, sizes = self._node_positions_and_colors()
-        if self._nodes_layer is not None:
-            try:
-                self.viewer.layers.remove(self._nodes_layer)
-            except (KeyError, ValueError):
-                pass
-            self._nodes_layer = None
-        if len(positions) == 0:
+        if self._nodes_layer is not None and self._nodes_layer in self.viewer.layers:
+            L = self._nodes_layer
+            L.selected_data = set()
+            L.data = positions
+            if len(positions):
+                L.face_color = colors
+                L.size = sizes
             return
         self._nodes_layer = self.viewer.add_points(
             positions,
             name="nodes",
-            face_color=colors,
-            size=sizes,
+            face_color=colors if len(positions) else "white",
+            size=sizes if len(positions) else 5,
             symbol="o",
         )
 
     def _refresh_edges_layer(self) -> None:
         """Base edges layer — uniform orange, never modified for
         selection.  Selected edges are drawn yellow on top in a small
-        overlay (see `_refresh_selection_overlays`)."""
-        segments = []
-        edge_pairs: List[Tuple] = []
+        overlay (see `_refresh_selection_overlays`).
+
+        Each edge is drawn from its `path` polyline (straight segment
+        when absent) as line segments in ONE napari Vectors layer.  Per-
+        edge segment arrays are cached, so after an edit only changed
+        edges are recomputed and the layer's data is swapped in place
+        (fast on 100k+ edges; a Shapes layer with one shape per edge
+        took seconds).  The layer is created once and never removed, so
+        its position in the layer stack — below nodes, above any tile
+        video — is preserved.
+        """
         G = self.editor.graph
         canon = GraphEditor._canonical_edge
-        for u, v in G.edges:
-            xu = float(G.nodes[u].get("x", 0.0))
-            yu = float(G.nodes[u].get("y", 0.0))
-            xv = float(G.nodes[v].get("x", 0.0))
-            yv = float(G.nodes[v].get("y", 0.0))
-            segments.append([
-                [self._image_h - yu, xu],
-                [self._image_h - yv, xv],
-            ])
-            edge_pairs.append(canon(u, v))
+        H = self._image_h
+        cache = getattr(self, "_edge_seg_cache", None)
+        if cache is None:
+            cache = self._edge_seg_cache = {}
+        new_cache, chunks, edge_pairs = {}, [], []
+        for u, v, d in G.edges(data=True):
+            pair = canon(u, v)
+            path = d.get("path")
+            nu, nv = G.nodes[u], G.nodes[v]
+            key = (id(path), nu.get("x"), nu.get("y"), nv.get("x"), nv.get("y"))
+            hit = cache.get(pair)
+            if hit is not None and hit[0] == key:
+                segs = hit[1]
+            else:
+                pts = None
+                if path is not None and len(path) >= 2:
+                    pa = np.asarray(path, dtype=float)
+                    if pa.ndim == 2 and pa.shape[1] >= 2:
+                        pts = pa[:, :2]
+                if pts is None:
+                    pts = np.array([[float(nu.get("x", 0.0)), float(nu.get("y", 0.0))],
+                                    [float(nv.get("x", 0.0)), float(nv.get("y", 0.0))]])
+                # path stores (x, y_math); napari wants (row, col)
+                rc = np.column_stack([H - pts[:, 1], pts[:, 0]])
+                segs = np.stack([rc[:-1], rc[1:] - rc[:-1]], axis=1)
+            new_cache[pair] = (key, segs)
+            chunks.append(segs)
+            edge_pairs.append(pair)
+        self._edge_seg_cache = new_cache
         self._edge_index_order = edge_pairs
         self._edge_pair_to_index = {p: i for i, p in enumerate(edge_pairs)}
-        if self._edges_layer is not None:
-            try:
-                self.viewer.layers.remove(self._edges_layer)
-            except (KeyError, ValueError):
-                pass
-            self._edges_layer = None
-        if not segments:
+        data = np.concatenate(chunks) if chunks else np.zeros((0, 2, 2))
+        if self._edges_layer is not None and self._edges_layer in self.viewer.layers:
+            self._edges_layer.data = data
             return
-        self._edges_layer = self.viewer.add_shapes(
-            segments,
-            shape_type="line",
+        self._edges_layer = self.viewer.add_vectors(
+            data,
             edge_color=EDGE_COLOR,
             edge_width=EDGE_WIDTH,
-            face_color="transparent",
             opacity=0.85,
             name="edges",
         )
-        # Move edges to bottom so node markers render on top.
+        # Move edges to just above the mask so node markers render on top.
         self.viewer.layers.move(
-            self.viewer.layers.index(self._edges_layer), 1,
+            self.viewer.layers.index(self._edges_layer),
+            1 if len(self.viewer.layers) > 1 else 0,
         )
 
     def _refresh_all(self) -> None:
@@ -401,14 +461,32 @@ class _EditorApp:
         _mode_btn("select", "Select  (key: 1)",
                    "Default mode.  Left click toggles the nearest "
                    "node or edge; left drag pans.")
-        _mode_btn("rect", "Rect-Select  (key: 2)",
-                   "Left drag draws a rubber-band rectangle and "
-                   "selects every node inside on release.  "
-                   "Hold Shift for additive.")
+        _mode_btn("rect", "Region-Select  (key: 2)",
+                   "Draw a region with the shape chosen below; every "
+                   "node inside (and every edge whose midpoint is inside) "
+                   "is selected — then d deletes.  Hold Shift when "
+                   "finishing the shape to add to the selection.")
+        from qtpy.QtWidgets import QComboBox as _QCB, QHBoxLayout as _QHB, QWidget as _QW
+        _row = _QW(); _rl = _QHB(_row); _rl.setContentsMargins(16, 0, 0, 0)
+        _rl.addWidget(QLabel("shape:"))
+        self._region_shape_combo = _QCB()
+        for lab, m in (("Rectangle (drag)", "add_rectangle"),
+                       ("Ellipse (drag)", "add_ellipse"),
+                       ("Lasso (click, trace, click)", "add_polygon_lasso"),
+                       ("Polygon (click vertices, dbl-click)", "add_polygon")):
+            self._region_shape_combo.addItem(lab, userData=m)
+        self._region_shape_combo.currentIndexChanged.connect(
+            lambda _i: self._set_mode("rect") if self._mode == "rect" else None)
+        _rl.addWidget(self._region_shape_combo, stretch=1)
+        layout.addWidget(_row)
         _mode_btn("add", "Add Node  (key: 3)",
                    "Left click creates a new node (snapped to the "
                    "local distance-transform peak if a distance "
                    "map is loaded).")
+        _mode_btn("move", "Move Node  (key: 4)",
+                   "Left click a node to pick it up, then left click "
+                   "the new position to place it.  Every incident edge "
+                   "is replaced with a straight-line 2-point path.")
         # Default mode highlighted.
         self._mode_btns["select"].setChecked(True)
 
@@ -427,6 +505,25 @@ class _EditorApp:
               "Remove every selected node (and its incident edges) "
               "AND every selected edge (keeping endpoints).",
               self._action_delete)
+        _btn("Delete vessel  (Shift-D)",
+              "Delete the whole vessel through each selected edge or "
+              "mid-vessel node: every edge and degree-2 node between its "
+              "two end nodes (junctions / tips), which are kept.",
+              self._action_delete_vessel)
+        from qtpy.QtWidgets import QSpinBox as _QSB, QHBoxLayout as _QHB2, QWidget as _QW2
+        _crow = _QW2(); _cl = _QHB2(_crow); _cl.setContentsMargins(0, 0, 0, 0)
+        _cb = QPushButton("Select disconnected pieces")
+        _cb.setToolTip(
+            "Select every connected component except the largest whose "
+            "total centreline length is at most 'max px' (0 = all of "
+            "them).  Review the yellow selection, then press d.")
+        _cb.clicked.connect(self._action_select_components)
+        _cl.addWidget(_cb, stretch=1)
+        _cl.addWidget(QLabel("max px:"))
+        self._comp_len_spin = _QSB(); self._comp_len_spin.setRange(0, 1000000)
+        self._comp_len_spin.setSingleStep(100); self._comp_len_spin.setValue(500)
+        _cl.addWidget(self._comp_len_spin)
+        layout.addWidget(_crow)
         _btn("Connect 2 selected  (e)",
               "Add an edge between the exactly-two selected nodes.",
               self._action_connect)
@@ -436,6 +533,32 @@ class _EditorApp:
         _btn("Streamline  (n)",
               "Collapse every degree-2 redundant node by merging edges.",
               self._action_streamline)
+
+        from qtpy.QtWidgets import QHBoxLayout, QDoubleSpinBox
+        _mj_row = QHBoxLayout()
+        _mj_row.addWidget(QLabel("Merge junctions ≤ (px):"))
+        self._merge_junction_spin = QDoubleSpinBox()
+        self._merge_junction_spin.setDecimals(1)
+        self._merge_junction_spin.setMinimum(0.5)
+        self._merge_junction_spin.setMaximum(100.0)
+        self._merge_junction_spin.setSingleStep(0.5)
+        self._merge_junction_spin.setValue(3.0)
+        self._merge_junction_spin.setToolTip(
+            "Distance threshold (px) for the 'Merge close junctions' "
+            "op below.  Default 3 px handles typical vectorize "
+            "triple-point artifacts (fat blob → N degree-3 nodes "
+            "clustered at one triangle centre).")
+        _mj_row.addWidget(self._merge_junction_spin)
+        _mj_widget = QWidget(); _mj_widget.setLayout(_mj_row)
+        layout.addWidget(_mj_widget)
+
+        _btn("Merge close junctions",
+              "Union-find every degree-≥3 node pair within the "
+              "threshold above and contract each cluster to a single "
+              "node at the centroid.  Radius = max of members.  Incident "
+              "edges rewired; parallel edges deduplicated (max radius, "
+              "min length).",
+              self._action_merge_close_junctions)
         _btn("Clear selection  (c)",
               "Drop the current node selection.",
               self._action_clear)
@@ -445,6 +568,135 @@ class _EditorApp:
         _btn("Save  (s)",
               f"Save graph to {self.default_save_path}.",
               self._action_save)
+
+        # Tip-marking workflow: mark a few real anchors, prune the rest.
+        _btn("Toggle true-tip flag  (t)",
+              "Mark every selected node as a 'true tip' (magenta) so "
+              "it survives Prune Unmarked Tips.  Toggles off if already "
+              "marked.  Flag applies to any node, not just degree-1.",
+              self._action_toggle_true_tip)
+        _btn("Prune unmarked tips  (Shift-P)",
+              "Delete every degree-1 node that does NOT carry the "
+              "true-tip flag.  Cascades — after deleting the current "
+              "unmarked tips, any node that just became degree-1 (and "
+              "isn't marked) is also deleted, until convergence.  Peels "
+              "off whole spur chains in one press.  Useful for cleaning "
+              "up triangulation artifacts after marking the ~4 "
+              "anatomical anchors by hand.",
+              self._action_prune_unmarked_tips)
+
+        # Trim-length spinbox for shorten-tip
+        from qtpy.QtWidgets import QSpinBox, QHBoxLayout
+        _shorten_row = QHBoxLayout()
+        _shorten_row.addWidget(QLabel("Shorten trim (px):"))
+        self._shorten_trim_spin = QSpinBox()
+        self._shorten_trim_spin.setMinimum(1)
+        self._shorten_trim_spin.setMaximum(500)
+        self._shorten_trim_spin.setValue(15)
+        self._shorten_trim_spin.setToolTip(
+            "Arc-length (in mask-pixel units) to trim off the tip end.")
+        _shorten_row.addWidget(self._shorten_trim_spin)
+        _shorten_widget = QWidget()
+        _shorten_widget.setLayout(_shorten_row)
+        layout.addWidget(_shorten_widget)
+
+        _btn("Shorten selected tips  (Shift-S)",
+              "For each selected degree-1 node, walk inward along its "
+              "incident edge by the trim distance (px) and place the "
+              "tip at the new position.  Path truncates + edge length "
+              "updates + tip radius resamples from the mask EDT.  "
+              "Preserves anatomical presence without inheriting the "
+              "vessel's tapered-end R.",
+              self._action_shorten_selected_tips)
+
+        # Gap bridging
+        from qtpy.QtWidgets import (QDoubleSpinBox, QCheckBox)
+        gap_label = QLabel("<b>Gap bridging</b>")
+        gap_label.setStyleSheet("padding: 6px 6px 2px 6px;")
+        layout.addWidget(gap_label)
+
+        _gap_row = QHBoxLayout()
+        _gap_row.addWidget(QLabel("D_max (px):"))
+        self._gap_dmax_spin = QDoubleSpinBox()
+        self._gap_dmax_spin.setDecimals(1)
+        self._gap_dmax_spin.setMinimum(1.0)
+        self._gap_dmax_spin.setMaximum(500.0)
+        self._gap_dmax_spin.setSingleStep(1.0)
+        self._gap_dmax_spin.setValue(15.0)
+        self._gap_dmax_spin.setToolTip(
+            "Maximum Euclidean distance (px) between leaf-node pairs to "
+            "consider as gap-bridge candidates.")
+        _gap_row.addWidget(self._gap_dmax_spin)
+        _gap_widget = QWidget(); _gap_widget.setLayout(_gap_row)
+        layout.addWidget(_gap_widget)
+
+        self._gap_diff_cc_chk = QCheckBox("Different components only")
+        self._gap_diff_cc_chk.setChecked(False)
+        self._gap_diff_cc_chk.setToolTip(
+            "When on, only pair leaves that live in different connected "
+            "components of the graph.  Off by default — many editable "
+            "graphs are one big component.")
+        layout.addWidget(self._gap_diff_cc_chk)
+
+        _topo_row = QHBoxLayout()
+        _topo_row.addWidget(QLabel("Min topo hops:"))
+        self._gap_topo_min_spin = QSpinBox()
+        self._gap_topo_min_spin.setMinimum(0)
+        self._gap_topo_min_spin.setMaximum(10000)
+        self._gap_topo_min_spin.setValue(15)
+        self._gap_topo_min_spin.setToolTip(
+            "For same-component pairs, require the graph-hop distance "
+            "between the two leaves to exceed this before treating them "
+            "as a bridge candidate.  0 = no topology filter (any close "
+            "leaf pair counts, even ones already connected via a 1-hop "
+            "detour).")
+        _topo_row.addWidget(self._gap_topo_min_spin)
+        _topo_widget = QWidget(); _topo_widget.setLayout(_topo_row)
+        layout.addWidget(_topo_widget)
+
+        self._gap_leaf_to_any_chk = QCheckBox(
+            "Also propose leaf → trunk (T-junctions)")
+        self._gap_leaf_to_any_chk.setChecked(True)
+        self._gap_leaf_to_any_chk.setToolTip(
+            "Also consider pairs where a leaf is close to an interior "
+            "node of another vessel (not a leaf).  Uses a stricter "
+            "D_max (see below).  Off by default because it fires "
+            "more aggressively.")
+        layout.addWidget(self._gap_leaf_to_any_chk)
+
+        _lta_row = QHBoxLayout()
+        _lta_row.addWidget(QLabel("Leaf→trunk D_max (px):"))
+        self._gap_dmax_lta_spin = QDoubleSpinBox()
+        self._gap_dmax_lta_spin.setDecimals(1)
+        self._gap_dmax_lta_spin.setMinimum(1.0)
+        self._gap_dmax_lta_spin.setMaximum(500.0)
+        self._gap_dmax_lta_spin.setSingleStep(1.0)
+        self._gap_dmax_lta_spin.setValue(15.0)
+        self._gap_dmax_lta_spin.setToolTip(
+            "Maximum Euclidean distance for the leaf → interior-node "
+            "(T-junction) case only.  Ignored when the checkbox above "
+            "is off.  Default is ~0.6× the leaf-leaf D_max.")
+        _lta_row.addWidget(self._gap_dmax_lta_spin)
+        _lta_widget = QWidget(); _lta_widget.setLayout(_lta_row)
+        layout.addWidget(_lta_widget)
+
+        _btn("Find gap bridges",
+              "Detect leaf pairs closer than D_max that are topologically "
+              "far.  Renders candidates as yellow lines on a preview "
+              "overlay.  Nothing is added to the graph until you press "
+              "'Bridge all shown'.",
+              self._action_find_gaps)
+        _btn("Bridge all shown",
+              "Add an edge for every candidate currently in the preview.  "
+              "Single undo step covers the whole batch.",
+              self._action_bridge_all_shown)
+        _btn("Clear gap preview",
+              "Remove the preview overlay without touching the graph.",
+              self._action_clear_gap_preview)
+
+        # State for the preview overlay
+        self._gap_preview_layer = None
+        self._gap_candidates: list = []
 
         # View toggles
         view_label = QLabel("<b>View</b>")
@@ -464,13 +716,110 @@ class _EditorApp:
             self._toggle_intermediates)
         layout.addWidget(self._intermediates_btn)
 
+        # ── Optional per-tile video overlay ──
+        if self._video_config is not None:
+            self._build_video_overlay_ui(layout, QPushButton, QLabel)
+
         layout.addStretch(1)
 
         widget = QWidget()
         widget.setLayout(layout)
+        # Wrap in a scroll area so the panel remains usable when it grows
+        # taller than the napari window (many controls stacked vertically).
+        from qtpy.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(widget)
         self.viewer.window.add_dock_widget(
-            widget, name="net3 edit", area="right",
+            scroll, name="net3 edit", area="right",
         )
+
+    def _build_video_overlay_ui(self, layout, QPushButton, QLabel):
+        """Add tile-video overlay controls to the dock.  Only called
+        when the caller passed tile-positions + video-dir + pattern
+        to run_editor."""
+        from qtpy.QtWidgets import QComboBox, QHBoxLayout, QWidget
+        from .video_overlay import (
+            VideoOverlayManager, load_tile_positions)
+        try:
+            positions = load_tile_positions(
+                self._video_config['tile_positions_path'])
+        except Exception as e:
+            print(f"[net3 edit] failed to load tile positions "
+                  f"({self._video_config['tile_positions_path']}): {e}")
+            return
+        if not positions:
+            print("[net3 edit] tile-positions JSON contained no usable entries")
+            return
+        mask_shape = None
+        try:
+            if self.editor.mask is not None:
+                mask_shape = tuple(int(x) for x in self.editor.mask.shape[:2])
+        except Exception:
+            mask_shape = None
+        self._video_overlay = VideoOverlayManager(
+            self.viewer, positions,
+            self._video_config['video_dirs'],
+            self._video_config['video_pattern'],
+            mask_shape=mask_shape)
+
+        layout.addWidget(QLabel("<b>Tile video overlay</b>"))
+        row = QWidget()
+        rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("Tile:"))
+        self._video_tile_combo = QComboBox()
+        for tid in self._video_overlay.available_tile_ids():
+            self._video_tile_combo.addItem(str(tid), userData=tid)
+        rl.addWidget(self._video_tile_combo, stretch=1)
+        layout.addWidget(row)
+
+        load_btn = QPushButton("Load tile video")
+        load_btn.setToolTip(
+            "Load the selected tile's video as a napari Image layer at "
+            "its mosaic position.  Use the built-in time slider to scrub "
+            "frames.  Loading a different tile removes the previous one.")
+        load_btn.clicked.connect(self._load_selected_tile_video)
+        layout.addWidget(load_btn)
+
+        unload_btn = QPushButton("Unload current video")
+        unload_btn.clicked.connect(self._unload_tile_video)
+        layout.addWidget(unload_btn)
+
+        # Tile boundary + label toggles (helpful for verifying video
+        # placement against the mosaic).  Mirrors the plexusflow viewer's
+        # "Show tile boundaries" / "Show tile numbers" checkboxes.
+        from qtpy.QtWidgets import QCheckBox
+        self._tile_bounds_chk = QCheckBox("Show tile boundaries")
+        self._tile_bounds_chk.setToolTip(
+            "Draw a yellow outline at every tile's mosaic footprint "
+            "(computed from the tile-positions affine).")
+        self._tile_bounds_chk.toggled.connect(
+            lambda c: self._video_overlay.set_show_tile_boundaries(bool(c)))
+        layout.addWidget(self._tile_bounds_chk)
+        self._tile_labels_chk = QCheckBox("Show tile numbers")
+        self._tile_labels_chk.setToolTip(
+            "Overlay the tile id at each tile's centre.")
+        self._tile_labels_chk.toggled.connect(
+            lambda c: self._video_overlay.set_show_tile_numbers(bool(c)))
+        layout.addWidget(self._tile_labels_chk)
+
+        print(f"[net3 edit] video overlay ready: "
+              f"{len(positions)} tiles in positions JSON, "
+              f"pattern={self._video_config['video_pattern']!r}, "
+              f"dirs={[str(d) for d in self._video_config['video_dirs']]}")
+
+    def _load_selected_tile_video(self):
+        if self._video_overlay is None:
+            return
+        tid = self._video_tile_combo.currentData()
+        if tid is None:
+            return
+        self._video_overlay.load_tile(int(tid))
+
+    def _unload_tile_video(self):
+        if self._video_overlay is None:
+            return
+        self._video_overlay.unload()
 
     # ── Key bindings + mouse ────────────────────────────────────
 
@@ -480,6 +829,10 @@ class _EditorApp:
         @v.bind_key("d", overwrite=True)
         def _(viewer):
             self._action_delete()
+
+        @v.bind_key("Shift-D", overwrite=True)
+        def _(viewer):
+            self._action_delete_vessel()
 
         @v.bind_key("e", overwrite=True)
         def _(viewer):
@@ -509,6 +862,18 @@ class _EditorApp:
         def _(viewer):
             self._toggle_intermediates()
 
+        @v.bind_key("t", overwrite=True)
+        def _(viewer):
+            self._action_toggle_true_tip()
+
+        @v.bind_key("Shift-P", overwrite=True)
+        def _(viewer):
+            self._action_prune_unmarked_tips()
+
+        @v.bind_key("Shift-S", overwrite=True)
+        def _(viewer):
+            self._action_shorten_selected_tips()
+
         # Mode shortcuts: 1 / 2 / 3 to switch.
         @v.bind_key("1", overwrite=True)
         def _(viewer):
@@ -521,6 +886,10 @@ class _EditorApp:
         @v.bind_key("3", overwrite=True)
         def _(viewer):
             self._set_mode("add")
+
+        @v.bind_key("4", overwrite=True)
+        def _(viewer):
+            self._set_mode("move")
 
         # Mouse model:
         #   left click            : toggle nearest node, fall back to nearest edge
@@ -596,6 +965,50 @@ class _EditorApp:
 
     def _handle_click(self, gx: float, gy: float, shift: bool) -> None:
         tol = self._click_tolerance()
+        # Move mode: first click on a node arms it, second click on empty
+        # canvas places it at the new position.  If a node is already
+        # armed (self._move_target set), the click places it and clears
+        # the arm.
+        if self._mode == "move":
+            armed = getattr(self, "_move_target", None)
+            if armed is None:
+                # Pick up: click on a node to select as move target.
+                node_hit = self.editor.node_at(gx, gy, tolerance=tol)
+                if node_hit is None:
+                    self._announce(
+                        "Move mode: click a node to pick it up, then click "
+                        "the new position.")
+                    return
+                self._move_target = node_hit
+                self._announce(
+                    f"picked up node {node_hit} — click to place at new "
+                    f"position (or press 1 to cancel).")
+                self._refresh_status()
+                return
+            # Place at (gx, gy).  Uses snap-to-centerline if the distance
+            # map is loaded (same behaviour as Add Node).
+            ok = self.editor.move_node(
+                armed, gx, gy, snap_window=SNAP_WINDOW_DEFAULT)
+            if ok:
+                nx = self.editor.graph.nodes[armed].get('x', gx)
+                ny = self.editor.graph.nodes[armed].get('y', gy)
+                self._announce(
+                    f"moved node {armed} to ({nx:.1f}, {ny:.1f}); incident "
+                    f"edge paths replaced with straight lines.")
+            else:
+                self._announce(
+                    f"move failed — node {armed} no longer exists.")
+            self._move_target = None
+            # A move touches node coords AND edge paths, so refresh
+            # everything.
+            self._refresh_edges_layer()
+            self._refresh_nodes_layer()
+            self._refresh_selection_overlays()
+            self._refresh_status()
+            # Auto-revert to Select so the next click doesn't accidentally
+            # start another move.  Press `4` to move again.
+            self._set_mode("select")
+            return
         # Add-Node mode (or Shift+click in any mode) creates a new node.
         if self._mode == "add" or shift:
             sticky = shift  # Shift+click is one-shot; Add Mode-1-shot too
@@ -698,8 +1111,11 @@ class _EditorApp:
         add_rectangle mode, napari swallows the left-drag (no pan) and
         draws a live rectangle preview itself.
         """
-        if mode not in ("select", "rect", "add"):
+        if mode not in ("select", "rect", "add", "move"):
             return
+        # Cancel any pending move-arm when leaving move mode.
+        if mode != "move" and getattr(self, "_move_target", None) is not None:
+            self._move_target = None
         self._mode = mode
         for k, b in self._mode_btns.items():
             try:
@@ -709,7 +1125,9 @@ class _EditorApp:
         self._ensure_rect_tool_layer()
         if mode == "rect" and self._rect_tool_layer is not None:
             try:
-                self._rect_tool_layer.mode = "add_rectangle"
+                combo = getattr(self, "_region_shape_combo", None)
+                self._rect_tool_layer.mode = (combo.currentData() if combo is not None
+                                              else "add_rectangle")
                 self.viewer.layers.selection.active = self._rect_tool_layer
             except Exception as e:
                 print(f"  rect mode setup failed: {e!r}")
@@ -729,8 +1147,9 @@ class _EditorApp:
             except Exception:
                 pass
         label = {"select": "Select",
-                  "rect": "Rect-Select",
-                  "add": "Add Node"}[mode]
+                  "rect": "Region-Select",
+                  "add": "Add Node",
+                  "move": "Move Node"}[mode]
         self._announce(f"mode → {label}")
         self._refresh_status()
 
@@ -761,48 +1180,69 @@ class _EditorApp:
                 opacity=0.5,
             )
 
-            @self._rect_tool_layer.mouse_drag_callbacks.append
-            def _on_layer_drag(layer, event):
-                yield from self._rect_layer_drag(layer, event)
+            # Process a finished shape (any type) once napari has fully
+            # committed it: defer out of the data-event so clearing the
+            # layer can't re-enter napari's drawing generator.
+            from qtpy.QtCore import QTimer
+
+            def _on_data(event):
+                if str(getattr(event, "action", "")) == "added":
+                    QTimer.singleShot(0, self._on_region_drawn)
+
+            self._rect_tool_layer.events.data.connect(_on_data)
 
         except Exception as e:
             print(f"  rect tool layer init failed: {e!r}")
             self._rect_tool_layer = None
 
-    def _rect_layer_drag(self, layer, event):
-        """Generator: runs alongside napari's add_rectangle to read
-        the finished rectangle and apply the selection."""
-        if self._mode != "rect" or event.button != 1:
+    def _on_region_drawn(self) -> None:
+        """Select everything inside the shape just drawn on the region
+        tool layer (rectangle, ellipse, lasso or polygon), then clear it."""
+        layer = self._rect_tool_layer
+        if layer is None or self._mode != "rect" or not len(layer.data):
             return
-        start = self._event_graph_xy(event)
-        if start is None:
-            return
-        shift = "Shift" in event.modifiers
-        yield  # let napari's add_rectangle press handler run
-        while event.type == "mouse_move":
-            yield
-        # mouse_release — napari just committed the rectangle, safe to read.
-        end = self._event_graph_xy(event)
-        if end is None:
-            return
-        dx = end[0] - start[0]
-        dy = end[1] - start[1]
-        moved = (dx * dx + dy * dy) > (DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX)
-        if moved:
-            self.editor.select_in_rect(
-                start[0], start[1], end[0], end[1], additive=shift,
-            )
-            self._announce(
-                f"rectangle-selected: {len(self.editor.selected)} node(s)"
-                + ("  (additive)" if shift else ""))
-            self._refresh_selection_overlays()
-        # Always clean up the napari-drawn rectangle so the next drag
-        # starts from an empty layer.  Safe here because napari's
-        # add_rectangle generator has already returned.
+        verts = np.asarray(layer.data[-1], float)[:, -2:]   # (row, col)
+        stype = layer.shape_type[-1]
+        if stype == "ellipse" and len(verts) == 4:
+            c = verts.mean(axis=0)
+            a = 0.5 * (verts[1] + verts[2]) - c
+            b = 0.5 * (verts[2] + verts[3]) - c
+            t = np.linspace(0, 2 * np.pi, 96, endpoint=False)[:, None]
+            verts = c + np.cos(t) * a + np.sin(t) * b
+        poly_xy = np.column_stack([verts[:, 1], self._image_h - verts[:, 0]])
         try:
+            from qtpy.QtCore import Qt
+            from qtpy.QtWidgets import QApplication
+            shift = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
+        except Exception:
+            shift = False
+        if len(poly_xy) >= 3:
+            nn, ne = self.editor.select_in_polygon(poly_xy, additive=shift)
+            self._announce(
+                f"region-selected {nn} node(s), {ne} edge(s)"
+                + ("  (additive)" if shift else "")
+                + f" — total {len(self.editor.selected)} nodes, "
+                  f"{len(self.editor.selected_edges)} edges; d deletes")
+            self._refresh_selection_overlays()
+        try:
+            mode = layer.mode
             layer.data = []
+            layer.mode = mode
         except Exception:
             pass
+        self._refresh_status()
+
+    def _action_select_components(self) -> None:
+        mx = float(self._comp_len_spin.value())
+        n_c, n_n = self.editor.select_small_components(mx)
+        total = len(self.editor.component_sizes())
+        self._announce(
+            f"selected {n_c} disconnected piece(s) ({n_n} nodes) of "
+            f"{total} components"
+            + (f", each ≤ {mx:.0f} px" if mx > 0 else ", all but the largest")
+            + " — press d to delete" if n_c else
+            "no disconnected pieces match")
+        self._refresh_selection_overlays()
         self._refresh_status()
 
     def _action_delete(self) -> None:
@@ -821,52 +1261,125 @@ class _EditorApp:
         self._refresh_all()
 
     def _action_connect(self) -> None:
-        # Snapshot the edge set so we can append only the new edge(s)
-        # rather than rebuild the whole Shapes layer.
-        before = set(GraphEditor._canonical_edge(u, v)
-                     for u, v in self.editor.graph.edges)
         ok = self.editor.connect_selected_pair()
         if ok:
             self._announce("added edge between the 2 selected nodes")
+            self._refresh_all()
         else:
             self._announce("connect needs exactly 2 selected nodes "
                             "(and edge must not already exist)")
+        self._refresh_status()
+
+    def _action_delete_vessel(self) -> None:
+        n_ves, n_nodes = self.editor.delete_selected_vessels()
+        if not n_ves:
+            self._announce("delete vessel: select an edge or a mid-vessel "
+                           "(degree-2) node first")
             self._refresh_status()
             return
-        after = set(GraphEditor._canonical_edge(u, v)
-                    for u, v in self.editor.graph.edges)
-        new_edges = list(after - before)
-        if (self._edges_layer is None or not new_edges
-                or len(new_edges) > 32):
-            # Fall back to full rebuild if the layer isn't around yet
-            # or many edges changed at once.
-            self._refresh_all()
+        self._announce(f"deleted {n_ves} vessel(s) ({n_nodes} interior "
+                       f"node(s)); end nodes kept — z to undo")
+        self._refresh_all()
+
+    def _action_find_gaps(self) -> None:
+        d_max = float(self._gap_dmax_spin.value())
+        diff_cc = bool(self._gap_diff_cc_chk.isChecked())
+        topo_min_raw = int(self._gap_topo_min_spin.value())
+        topo_min = topo_min_raw if topo_min_raw > 0 else None
+        allow_lta = bool(self._gap_leaf_to_any_chk.isChecked())
+        d_lta = float(self._gap_dmax_lta_spin.value())
+        cands = self.editor.find_gap_candidates(
+            d_max=d_max,
+            require_different_components=diff_cc,
+            topo_min=topo_min,
+            allow_leaf_to_any=allow_lta,
+            d_max_leaf_to_any=d_lta)
+        self._gap_candidates = cands
+        self._render_gap_preview(cands)
+        topo_tag = f", topo>{topo_min}" if topo_min else ""
+        cc_tag = "diff-CC" if diff_cc else "any-CC"
+        lta_tag = f", +leaf→trunk D≤{d_lta:g}" if allow_lta else ""
+        self._announce(f"found {len(cands)} gap-bridge candidate(s) "
+                        f"(D_max={d_max:g}, {cc_tag}{topo_tag}{lta_tag})")
+
+    def _render_gap_preview(self, candidates) -> None:
+        # Rasterize candidate bridges as an RGBA image overlay.
+        from skimage.draw import line_aa
+        H = self._image_h
+        # Prefer mask width; else fall back to max x in graph.
+        if self.editor.mask is not None:
+            W = int(self.editor.mask.shape[1])
+        else:
+            xs = [float(self.editor.graph.nodes[n].get("x", 0.0))
+                  for n in self.editor.graph.nodes]
+            W = int(max(xs) + 1) if xs else H
+        canvas = np.zeros((H, W, 4), dtype=np.uint8)
+        # yellow fill, opaque
+        for (u, v, _d) in candidates:
+            if u not in self.editor.graph or v not in self.editor.graph:
+                continue
+            xu = float(self.editor.graph.nodes[u].get("x", 0.0))
+            yu = float(self.editor.graph.nodes[u].get("y", 0.0))
+            xv = float(self.editor.graph.nodes[v].get("x", 0.0))
+            yv = float(self.editor.graph.nodes[v].get("y", 0.0))
+            r0, c0 = int(round(H - yu)), int(round(xu))
+            r1, c1 = int(round(H - yv)), int(round(xv))
+            r0 = max(0, min(H - 1, r0)); r1 = max(0, min(H - 1, r1))
+            c0 = max(0, min(W - 1, c0)); c1 = max(0, min(W - 1, c1))
+            rr, cc, val = line_aa(r0, c0, r1, c1)
+            a = (val * 255).astype(np.uint8)
+            canvas[rr, cc, 0] = 255           # R
+            canvas[rr, cc, 1] = 220           # G  → yellow
+            canvas[rr, cc, 2] = 0             # B
+            canvas[rr, cc, 3] = np.maximum(canvas[rr, cc, 3], a)
+        # Widen lines a bit by dilating alpha with a 3x3 max filter.
+        from scipy.ndimage import maximum_filter
+        canvas[..., 3] = maximum_filter(canvas[..., 3], size=3)
+
+        if self._gap_preview_layer is not None:
+            try:
+                self.viewer.layers.remove(self._gap_preview_layer)
+            except (KeyError, ValueError):
+                pass
+            self._gap_preview_layer = None
+        if not candidates:
             return
-        # Incremental append — O(|new edges|) instead of O(|all edges|).
-        try:
-            G = self.editor.graph
-            segs = []
-            for u, v in new_edges:
-                xu = float(G.nodes[u].get("x", 0.0))
-                yu = float(G.nodes[u].get("y", 0.0))
-                xv = float(G.nodes[v].get("x", 0.0))
-                yv = float(G.nodes[v].get("y", 0.0))
-                segs.append([
-                    [self._image_h - yu, xu],
-                    [self._image_h - yv, xv],
-                ])
-            self._edges_layer.add_lines(segs, edge_color=EDGE_COLOR,
-                                        edge_width=EDGE_WIDTH)
-            # Maintain index bookkeeping the rest of the editor relies on.
-            for pair in new_edges:
-                self._edge_pair_to_index[pair] = len(self._edge_index_order)
-                self._edge_index_order.append(pair)
-            self._refresh_nodes_layer()
-            self._refresh_selection_overlays()
-            self._refresh_status()
-        except Exception:
-            # Anything goes wrong → fall back to a full rebuild.
+        self._gap_preview_layer = self.viewer.add_image(
+            canvas, rgb=True, name="gap-bridge preview", opacity=1.0)
+
+    def _action_bridge_all_shown(self) -> None:
+        if not self._gap_candidates:
+            self._announce("no gap candidates to bridge — press "
+                            "'Find gap bridges' first")
+            return
+        n = self.editor.bridge_gaps(self._gap_candidates)
+        self._gap_candidates = []
+        # Clear the preview and rebuild everything now that edges landed.
+        if self._gap_preview_layer is not None:
+            try:
+                self.viewer.layers.remove(self._gap_preview_layer)
+            except (KeyError, ValueError):
+                pass
+            self._gap_preview_layer = None
+        self._refresh_all()
+        self._announce(f"bridged {n} gap(s)")
+
+    def _action_clear_gap_preview(self) -> None:
+        self._gap_candidates = []
+        if self._gap_preview_layer is not None:
+            try:
+                self.viewer.layers.remove(self._gap_preview_layer)
+            except (KeyError, ValueError):
+                pass
+            self._gap_preview_layer = None
+        self._announce("cleared gap preview")
+
+    def _action_merge_close_junctions(self) -> None:
+        d_max = float(self._merge_junction_spin.value())
+        n = self.editor.merge_close_junctions(d_max=d_max)
+        if n:
             self._refresh_all()
+        self._announce(f"merged {n} junction node(s) at ≤{d_max:g} px")
 
     def _action_cycles(self) -> None:
         n = self.editor.select_cycles()
@@ -888,60 +1401,11 @@ class _EditorApp:
         self._refresh_status()
 
     def _action_undo(self) -> None:
-        canon = GraphEditor._canonical_edge
-        edges_before = set(canon(u, v)
-                           for u, v in self.editor.graph.edges)
         ok = self.editor.undo()
         self._announce("undo applied" if ok else "(nothing to undo)")
-        if not ok:
-            self._refresh_status()
-            return
-        edges_after = set(canon(u, v) for u, v in self.editor.graph.edges)
-        added = list(edges_after - edges_before)
-        removed = list(edges_before - edges_after)
-        # Fall back to full rebuild when many edges changed (streamline,
-        # bulk delete, etc) or when the layer doesn't exist yet.
-        if (self._edges_layer is None
-                or len(added) + len(removed) > 32):
+        if ok:
             self._refresh_all()
-            return
-        try:
-            if removed:
-                removed_set = set(removed)
-                idxs = [self._edge_pair_to_index[p]
-                        for p in removed if p in self._edge_pair_to_index]
-                if idxs:
-                    self._edges_layer.selected_data = set(idxs)
-                    self._edges_layer.remove_selected()
-                self._edge_index_order = [
-                    p for p in self._edge_index_order
-                    if p not in removed_set
-                ]
-                self._edge_pair_to_index = {
-                    p: i for i, p in enumerate(self._edge_index_order)
-                }
-            if added:
-                G = self.editor.graph
-                segs = []
-                for u, v in added:
-                    xu = float(G.nodes[u].get("x", 0.0))
-                    yu = float(G.nodes[u].get("y", 0.0))
-                    xv = float(G.nodes[v].get("x", 0.0))
-                    yv = float(G.nodes[v].get("y", 0.0))
-                    segs.append([
-                        [self._image_h - yu, xu],
-                        [self._image_h - yv, xv],
-                    ])
-                self._edges_layer.add_lines(segs, edge_color=EDGE_COLOR,
-                                             edge_width=EDGE_WIDTH)
-                for pair in added:
-                    self._edge_pair_to_index[pair] = len(self._edge_index_order)
-                    self._edge_index_order.append(pair)
-            self._refresh_nodes_layer()
-            self._refresh_selection_overlays()
-            self._refresh_status()
-        except Exception:
-            self._refresh_all()
+        self._refresh_status()
 
     def _action_save(self) -> None:
         self.editor.save(self.default_save_path)
@@ -954,6 +1418,46 @@ class _EditorApp:
             )
         except Exception:
             pass
+        self._refresh_status()
+
+    def _action_toggle_true_tip(self) -> None:
+        """If any selected node is already a true-tip, unmark all selected;
+        otherwise flag all selected."""
+        if not self.editor.selected:
+            self._announce("no selection to flag")
+            return
+        already = {n for n in self.editor.selected
+                    if self.editor.graph.nodes[n].get("true_tip")}
+        if already == set(self.editor.selected):
+            n = self.editor.unmark_selected_as_true_tips()
+            self._announce(f"cleared true-tip on {n} node(s)")
+        else:
+            n = self.editor.mark_selected_as_true_tips()
+            self._announce(f"marked {n} node(s) as true tips")
+        # Deselect the flagged nodes so the next click starts fresh.
+        self.editor.selected.clear()
+        self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
+        self._refresh_status()
+
+    def _action_prune_unmarked_tips(self) -> None:
+        n_flagged = len(self.editor.true_tip_nodes())
+        n = self.editor.prune_unmarked_tips()
+        self._announce(
+            f"pruned {n} unmarked tip(s)  ({n_flagged} true-tip(s) preserved)")
+        self._refresh_edges_layer()
+        self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
+        self._refresh_status()
+
+    def _action_shorten_selected_tips(self) -> None:
+        trim = int(self._shorten_trim_spin.value()) if getattr(
+            self, "_shorten_trim_spin", None) is not None else 15
+        n = self.editor.shorten_selected_tips(float(trim))
+        self._announce(f"shortened {n} tip(s) by {trim} px")
+        self._refresh_edges_layer()
+        self._refresh_nodes_layer()
+        self._refresh_selection_overlays()
         self._refresh_status()
 
     def _toggle_intermediates(self) -> None:
@@ -972,8 +1476,9 @@ class _EditorApp:
     def _refresh_status(self) -> None:
         last = getattr(self, "_last_action", "(no action yet)")
         mode_label = {"select": "Select",
-                       "rect": "Rect-Select",
-                       "add": "Add Node"}.get(self._mode, self._mode)
+                       "rect": "Region-Select",
+                       "add": "Add Node",
+                       "move": "Move Node"}.get(self._mode, self._mode)
         text = (
             f"<b>mode:</b> {mode_label}<br>"
             f"<b>graph:</b> {self.editor.n_nodes} nodes, "
